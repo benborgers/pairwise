@@ -30,8 +30,15 @@ final class CallController {
     private let screenUnpacker = VideoFrameUnpacker()
     private var lastCameraSeq: UInt32?
     private var lastScreenSeq: UInt32?
-    private let unpackOkCounter = PWCounter("video frames displayed", every: 100)
-    private let unpackDropCounter = PWCounter("video frames dropped pre-decode", every: 30)
+    // Encoders rebuilt mid-call (camera toggle, device change, re-share)
+    // must continue the previous sequence numbering — the receiver treats
+    // backward-running sequences as stale packets and drops them.
+    private var cameraSeqNext: UInt32 = 0
+    private var screenSeqNext: UInt32 = 0
+    private let cameraOkCounter = PWCounter("camera frames displayed", every: 100)
+    private let screenOkCounter = PWCounter("screen frames displayed", every: 100)
+    private let cameraDropCounter = PWCounter("camera frames dropped pre-decode", every: 30)
+    private let screenDropCounter = PWCounter("screen frames dropped pre-decode", every: 30)
 
     // UI
     private var videoWindow: VideoWindow?
@@ -184,7 +191,10 @@ final class CallController {
         }
         audio.start()
 
-        // Camera out.
+        // Camera out. Fresh call, fresh sequence spaces (the peer's transport
+        // starts empty too).
+        cameraSeqNext = 0
+        screenSeqNext = 0
         if cameraOn { startCamera() }
 
         // Peer video window.
@@ -217,8 +227,7 @@ final class CallController {
 
         audio.stop()
         camera.stop()
-        cameraEncoder?.invalidate()
-        cameraEncoder = nil
+        retireCameraEncoder()
         stopScreenShareInternal()
         transport.stop()
 
@@ -230,6 +239,7 @@ final class CallController {
         outgoingWindow = nil
         screenViewer?.close()
         screenViewer = nil
+        updateActivationPolicy()
         remoteSharingScreen = false
         remoteCameraOn = true
 
@@ -244,11 +254,11 @@ final class CallController {
 
     func toggleCamera() {
         cameraOn.toggle()
+        PWLog("camera toggled \(cameraOn ? "ON" : "OFF")")
         if case .inCall = state {
             if cameraOn { startCamera() } else {
                 camera.stop()
-                cameraEncoder?.invalidate()
-                cameraEncoder = nil
+                retireCameraEncoder()
             }
             sendLocalState()
         }
@@ -287,8 +297,7 @@ final class CallController {
     func cameraDeviceChanged() {
         guard case .inCall = state, cameraOn else { return }
         camera.stop()
-        cameraEncoder?.invalidate()
-        cameraEncoder = nil
+        retireCameraEncoder()
         startCamera()
     }
 
@@ -300,9 +309,18 @@ final class CallController {
 
     // MARK: - Camera pipeline
 
+    /// Fold a retiring encoder's sequence position back into the counter the
+    /// next encoder will start from, so numbering never runs backward.
+    private func retireCameraEncoder() {
+        if let encoder = cameraEncoder { cameraSeqNext = encoder.nextSequence }
+        cameraEncoder?.invalidate()
+        cameraEncoder = nil
+    }
+
     private func startCamera() {
         let encoder = VideoEncoder(config: .init(width: 1280, height: 720, fps: 30,
-                                                 bitrate: 1_200_000, keyframeInterval: 2))
+                                                 bitrate: 1_200_000, keyframeInterval: 2),
+                                   firstSequence: cameraSeqNext)
         encoder.onEncodedFrame = { [weak self] data, key, seq, ts in
             self?.transport.sendFrame(stream: .camera, isKeyframe: key,
                                       sequence: seq, timestampUs: ts, data: data)
@@ -352,8 +370,10 @@ final class CallController {
                 let size = self.screenCapture.capturedSize
                 let longSide = max(size.width, size.height)
                 let bitrate = longSide <= 1280 ? 2_500_000 : longSide <= 1920 ? 4_000_000 : 6_000_000
+                PWLog("screen share started: capture \(Int(size.width))x\(Int(size.height)), seq from \(self.screenSeqNext)")
                 let encoder = VideoEncoder(config: .init(width: Int32(size.width), height: Int32(size.height),
-                                                         fps: 60, bitrate: bitrate, keyframeInterval: 4))
+                                                         fps: 60, bitrate: bitrate, keyframeInterval: 4),
+                                           firstSequence: self.screenSeqNext)
                 encoder.onEncodedFrame = { [weak self] data, key, seq, ts in
                     self?.transport.sendFrame(stream: .screen, isKeyframe: key,
                                               sequence: seq, timestampUs: ts, data: data)
@@ -376,7 +396,9 @@ final class CallController {
     }
 
     private func stopScreenShareInternal() {
+        if sharingScreen { PWLog("screen share stopped") }
         screenCapture.stop()
+        if let encoder = screenEncoder { screenSeqNext = encoder.nextSequence }
         screenEncoder?.invalidate()
         screenEncoder = nil
         annotationOverlay?.close()
@@ -403,13 +425,26 @@ final class CallController {
             viewer.onStroke = { [weak self] points, strokeID in
                 self?.control?.send(.annotationStroke(points: points, colorIndex: 0, strokeID: strokeID))
             }
+            screenViewer = viewer
+            updateActivationPolicy()
             viewer.makeKeyAndOrderFront(nil)
             NSApp.activate(ignoringOtherApps: true)
-            screenViewer = viewer
+            PWLog("screen viewer opened (aspect \(String(format: "%.2f", screenAspect)))")
         } else if !sharingScreen && remoteSharingScreen {
             remoteSharingScreen = false
             screenViewer?.close()
             screenViewer = nil
+            updateActivationPolicy()
+            PWLog("screen viewer closed")
+        }
+    }
+
+    /// A Dock icon exists only while watching a share, so ⌘-tab can reach the
+    /// viewer window; the rest of the time Pairwise stays a menu bar app.
+    private func updateActivationPolicy() {
+        let policy: NSApplication.ActivationPolicy = screenViewer != nil ? .regular : .accessory
+        if NSApp.activationPolicy() != policy {
+            NSApp.setActivationPolicy(policy)
         }
     }
 
@@ -458,26 +493,28 @@ final class CallController {
 
     private func handleVideoFrame(_ frame: MediaFrame, unpacker: VideoFrameUnpacker,
                                   lastSeq: inout UInt32?, deliver: (CMSampleBuffer) -> Void) {
+        let okCounter = frame.stream == .camera ? cameraOkCounter : screenOkCounter
+        let dropCounter = frame.stream == .camera ? cameraDropCounter : screenDropCounter
         // A gap in sequence numbers means we lost a frame; decoding subsequent
         // deltas would corrupt, so resync on the next keyframe.
         if let last = lastSeq, frame.sequence != last &+ 1, !frame.isKeyframe {
-            unpackDropCounter.tick("\(frame.stream) gap \(last)->\(frame.sequence)")
+            dropCounter.tick("gap \(last)->\(frame.sequence)")
             unpacker.reset()
             lastSeq = nil
             transport.requestKeyframe(frame.stream)
             return
         }
         if unpacker.needsKeyframe && !frame.isKeyframe {
-            unpackDropCounter.tick("\(frame.stream) waiting for keyframe, got seq \(frame.sequence)")
+            dropCounter.tick("waiting for keyframe, got seq \(frame.sequence)")
             transport.requestKeyframe(frame.stream)
             return
         }
         lastSeq = frame.sequence
         if let sb = unpacker.unpack(frame: frame) {
-            unpackOkCounter.tick("\(frame.stream)")
+            okCounter.tick()
             deliver(sb)
         } else {
-            unpackDropCounter.tick("\(frame.stream) unpack returned nil, seq \(frame.sequence), key=\(frame.isKeyframe)")
+            dropCounter.tick("unpack returned nil, seq \(frame.sequence), key=\(frame.isKeyframe)")
         }
     }
 

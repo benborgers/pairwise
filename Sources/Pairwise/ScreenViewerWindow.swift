@@ -15,14 +15,27 @@ final class ScreenViewerWindow: NSWindow {
     }
 
     init(peerName: String, aspect: Double) {
+        // No .closable: losing this window mid-share is unrecoverable, so it
+        // can only go away when the share (or call) ends.
+        let style: NSWindow.StyleMask = [.titled, .miniaturizable, .resizable]
         let screen = NSScreen.main?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
-        let width = min(screen.width * 0.7, 1200)
-        let height = width / max(aspect, 0.2)
-        let frame = NSRect(x: screen.midX - width / 2, y: screen.midY - height / 2,
+        // Fill the visible screen area, preserving aspect — the video should
+        // touch at least two opposite edges.
+        let a = max(aspect, 0.2)
+        let titleBar = NSWindow.frameRect(forContentRect: NSRect(x: 0, y: 0, width: 100, height: 100),
+                                          styleMask: style).height - 100
+        var width = screen.width
+        var height = width / a
+        if height + titleBar > screen.height {
+            height = screen.height - titleBar
+            width = height * a
+        }
+        let frame = NSRect(x: screen.midX - width / 2,
+                           y: screen.midY - (height + titleBar) / 2,
                            width: width, height: height)
         annotationView = ViewerAnnotationView(frame: NSRect(origin: .zero, size: frame.size))
         super.init(contentRect: frame,
-                   styleMask: [.titled, .closable, .miniaturizable, .resizable],
+                   styleMask: style,
                    backing: .buffered, defer: false)
         title = "\(peerName)'s Screen"
         contentAspectRatio = NSSize(width: aspect, height: 1)

@@ -15,7 +15,8 @@ final class VideoEncoder {
 
     private var session: VTCompressionSession?
     private var config: Config
-    private var sequence: UInt32 = 0
+    private let baseConfig: Config
+    private var sequence: UInt32
     private var forceKeyframeFlag = false
     private let lock = NSLock()
 
@@ -23,9 +24,21 @@ final class VideoEncoder {
     var onEncodedFrame: ((_ data: Data, _ isKeyframe: Bool, _ sequence: UInt32, _ timestampUs: UInt64) -> Void)?
     private lazy var emitCounter = PWCounter("encoder[\(config.width)x\(config.height)] frames out", every: 150)
     private lazy var inCounter = PWCounter("encoder[\(config.width)x\(config.height)] frames in", every: 150)
+    private lazy var dropCounter = PWCounter("encoder[\(config.width)x\(config.height)] frames DROPPED by rate control", every: 30)
 
-    init(config: Config) {
+    /// The receiver treats each (stream, sequence) space as monotonic, so a
+    /// replacement encoder mid-call must continue where the last one stopped
+    /// — pass the retiring encoder's `nextSequence` as `firstSequence`.
+    init(config: Config, firstSequence: UInt32 = 0) {
         self.config = config
+        self.baseConfig = config
+        self.sequence = firstSequence
+    }
+
+    /// The sequence number the next emitted frame will carry.
+    var nextSequence: UInt32 {
+        lock.lock(); defer { lock.unlock() }
+        return sequence
     }
 
     deinit { invalidate() }
@@ -56,6 +69,16 @@ final class VideoEncoder {
         invalidate()
         config.width = width
         config.height = height
+        // If the source delivers more pixels than the config planned for
+        // (e.g. a camera that ignores the requested format), keep the bits-
+        // per-pixel budget: a starved rate controller silently drops frames.
+        let planned = Double(baseConfig.width) * Double(baseConfig.height)
+        let actual = Double(width) * Double(height)
+        if actual > planned * 1.2 {
+            config.bitrate = Int(Double(baseConfig.bitrate) * actual / planned)
+        } else {
+            config.bitrate = baseConfig.bitrate
+        }
 
         // Low-latency rate control is ideal but only some hardware encoders
         // support it (e.g. not most Intel Macs) — fall back to a standard
@@ -127,7 +150,13 @@ final class VideoEncoder {
         ) { [weak self] status, _, sampleBuffer in
             guard let self else { return }
             guard status == noErr, let sb = sampleBuffer else {
-                PWLog("encode callback error \(status), sample=\(sampleBuffer != nil)")
+                // noErr with no sample buffer = the rate controller dropped
+                // the frame (bitrate too low for the content), not an error.
+                if status == noErr {
+                    self.dropCounter.tick()
+                } else {
+                    PWLog("encode callback error \(status)")
+                }
                 return
             }
             self.emit(sampleBuffer: sb)
@@ -176,8 +205,10 @@ final class VideoEncoder {
 
         let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
         let tsUs = UInt64(max(0, pts.seconds) * 1_000_000)
+        lock.lock()
         let seq = sequence
         sequence &+= 1
+        lock.unlock()
         emitCounter.tick("seq \(seq), key=\(isKeyframe), \(out.count)B")
         onEncodedFrame?(out, isKeyframe, seq, tsUs)
     }

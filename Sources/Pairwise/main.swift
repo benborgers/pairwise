@@ -232,7 +232,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             sub.addItem(item)
         }
         let root = NSMenuItem(title: "Screen Share Resolution", action: nil, keyEquivalent: "")
-        root.image = NSImage(systemSymbolName: "rectangle.inset.filled", accessibilityDescription: nil)
+        root.image = NSImage(systemSymbolName: "rectangle.expand.diagonal", accessibilityDescription: nil)
         root.submenu = sub
         return root
     }

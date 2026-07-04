@@ -15,8 +15,11 @@ final class VideoDisplayView: NSView {
 
     required init?(coder: NSCoder) { fatalError() }
 
+    private let failCounter = PWCounter("display layer FAILED, flushing", every: 10)
+
     func enqueue(_ sampleBuffer: CMSampleBuffer) {
         if displayLayer.status == .failed {
+            failCounter.tick(displayLayer.error.map { "\($0)" } ?? "no error detail")
             displayLayer.flush()
         }
         displayLayer.enqueue(sampleBuffer)

@@ -338,7 +338,10 @@ final class AudioPipeline {
         }
         queue.async { [weak self] in
             self?.pending.removeAll()
-            self?.sequence = 0
+            // The sequence deliberately survives stop/start: the receiver
+            // drops packets whose sequence runs backward, so an engine
+            // rebuild mid-call (mic change, AEC fallback) must not restart
+            // numbering or the peer goes silent until it catches up.
         }
     }
 

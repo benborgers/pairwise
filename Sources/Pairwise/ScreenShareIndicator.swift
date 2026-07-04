@@ -1,9 +1,8 @@
 import AppKit
-import PWShim
 
-/// Sharer-side reminder that the screen is being shared: yellow L-shaped
-/// marks in the four screen corners. Click-through, above everything, and
-/// excluded from capture so the viewer never sees them.
+/// Sharer-side reminder that the screen is being shared: opaque yellow marks
+/// hugging the screen corners. Click-through, above everything, and excluded
+/// from capture so the viewer never sees them.
 final class ScreenShareIndicatorWindow: NSWindow {
     var windowID: CGWindowID { CGWindowID(windowNumber) }
 
@@ -17,7 +16,7 @@ final class ScreenShareIndicatorWindow: NSWindow {
         level = .screenSaver
         collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary]
         let view = CornerMarksView(frame: NSRect(origin: .zero, size: screen.frame.size),
-                                   displayCornerRadius: screen.pwDisplayCornerRadius)
+                                   bezelPath: screen.pwBezelPath)
         view.autoresizingMask = [.width, .height]
         contentView = view
         isReleasedWhenClosed = false
@@ -25,63 +24,83 @@ final class ScreenShareIndicatorWindow: NSWindow {
 }
 
 private extension NSScreen {
-    /// Physical rounded-corner radius of the panel: MacBook built-in displays
-    /// report their real radius, external displays 0. Private key, so read
-    /// defensively and fall back to square corners if it ever goes away.
-    var pwDisplayCornerRadius: CGFloat {
-        var radius: CGFloat = 0
-        _ = PWTryCatch({
-            radius = (self.value(forKey: "_displayCornerRadius") as? CGFloat) ?? 0
-        }, nil)
-        return radius
+    /// Physical outline of the panel (rounded top corners, notch cutout) in
+    /// screen-local points — private `bezelPath` method on MacBook built-in
+    /// displays. Read defensively; nil means square corners (external
+    /// displays, or the API going away).
+    var pwBezelPath: NSBezierPath? {
+        let selector = NSSelectorFromString("bezelPath")
+        guard responds(to: selector),
+              let path = perform(selector)?.takeUnretainedValue() as? NSBezierPath,
+              let local = path.copy() as? NSBezierPath else { return nil }
+        // Seen local so far, but localize if a screen ever reports globally.
+        if frame.origin != .zero,
+           abs(local.bounds.minX - frame.minX) < 1, abs(local.bounds.minY - frame.minY) < 1 {
+            local.transform(using: AffineTransform(translationByX: -frame.minX, byY: -frame.minY))
+        }
+        // Sanity: the outline should span the whole panel.
+        guard abs(local.bounds.width - frame.width) < 4,
+              abs(local.bounds.height - frame.height) < 4 else {
+            PWLog("bezelPath bounds \(local.bounds) don't match screen \(frame); ignoring")
+            return nil
+        }
+        return local
     }
 }
 
 private final class CornerMarksView: NSView {
-    private let displayCornerRadius: CGFloat
+    private let bezelPath: NSBezierPath?
 
-    init(frame: NSRect, displayCornerRadius: CGFloat) {
-        self.displayCornerRadius = displayCornerRadius
+    init(frame: NSRect, bezelPath: NSBezierPath?) {
+        self.bezelPath = bezelPath
         super.init(frame: frame)
     }
 
     required init?(coder: NSCoder) { fatalError() }
 
     override func draw(_ dirtyRect: NSRect) {
-        let length: CGFloat = 28
+        // Long enough to cover a MacBook panel's full corner curve (~37 pt)
+        // plus a stub of straight edge.
+        let length: CGFloat = 44
         let thickness: CGFloat = 4
-        let inset = thickness / 2
         let b = bounds
         NSColor.systemYellow.setStroke()
 
-        // (corner, horizontal direction, vertical direction, follows panel curve).
-        // Only the top corners of MacBook panels are rounded; the bottom edge
-        // is square, as is every corner of an external display (radius 0).
-        for (corner, dx, dy, rounded) in [
-            (NSPoint(x: b.minX, y: b.minY), CGFloat(1), CGFloat(1), false),   // bottom left
-            (NSPoint(x: b.maxX, y: b.minY), CGFloat(-1), CGFloat(1), false),  // bottom right
-            (NSPoint(x: b.minX, y: b.maxY), CGFloat(1), CGFloat(-1), true),   // top left
-            (NSPoint(x: b.maxX, y: b.maxY), CGFloat(-1), CGFloat(-1), true),  // top right
-        ] {
-            // Stroke centerline runs inset from the screen edge: down one arm,
-            // around the panel's corner arc, and out the other arm.
-            let r = rounded ? max(displayCornerRadius - inset, 0) : 0
-            let path = NSBezierPath()
-            path.move(to: NSPoint(x: corner.x + dx * inset, y: corner.y + dy * length))
-            if r > 0 {
-                let center = NSPoint(x: corner.x + dx * (inset + r), y: corner.y + dy * (inset + r))
-                path.line(to: NSPoint(x: corner.x + dx * inset, y: center.y))
-                path.appendArc(withCenter: center, radius: r,
-                               startAngle: dx > 0 ? 180 : 0,
-                               endAngle: dy > 0 ? 270 : 90,
-                               clockwise: (dx > 0) != (dy > 0))
-                path.line(to: NSPoint(x: corner.x + dx * length, y: corner.y + dy * inset))
-            } else {
+        let cornerBoxes = [
+            NSRect(x: b.minX, y: b.minY, width: length, height: length),
+            NSRect(x: b.maxX - length, y: b.minY, width: length, height: length),
+            NSRect(x: b.minX, y: b.maxY - length, width: length, height: length),
+            NSRect(x: b.maxX - length, y: b.maxY - length, width: length, height: length),
+        ]
+
+        if let bezel = bezelPath {
+            // Stroke the panel outline itself, clipped to the corner boxes.
+            // The stroke straddles the outline, so the outer half falls
+            // beyond the physical edge and a `thickness` band remains inside,
+            // matching the device's real corner curve exactly.
+            bezel.lineWidth = thickness * 2
+            for box in cornerBoxes {
+                NSGraphicsContext.current?.saveGraphicsState()
+                NSBezierPath(rect: box).addClip()
+                bezel.stroke()
+                NSGraphicsContext.current?.restoreGraphicsState()
+            }
+        } else {
+            // Square L-marks for displays without a known panel outline.
+            let inset = thickness / 2
+            for (corner, dx, dy) in [
+                (NSPoint(x: b.minX, y: b.minY), CGFloat(1), CGFloat(1)),
+                (NSPoint(x: b.maxX, y: b.minY), CGFloat(-1), CGFloat(1)),
+                (NSPoint(x: b.minX, y: b.maxY), CGFloat(1), CGFloat(-1)),
+                (NSPoint(x: b.maxX, y: b.maxY), CGFloat(-1), CGFloat(-1)),
+            ] {
+                let path = NSBezierPath()
+                path.move(to: NSPoint(x: corner.x + dx * inset, y: corner.y + dy * length))
                 path.line(to: NSPoint(x: corner.x + dx * inset, y: corner.y + dy * inset))
                 path.line(to: NSPoint(x: corner.x + dx * length, y: corner.y + dy * inset))
+                path.lineWidth = thickness
+                path.stroke()
             }
-            path.lineWidth = thickness
-            path.stroke()
         }
     }
 }

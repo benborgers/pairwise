@@ -19,12 +19,27 @@ final class ScreenShareCapture: NSObject, SCStreamOutput, SCStreamDelegate {
     func start(completion: @escaping (Bool) -> Void) {
         Task {
             do {
-                let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
+                // The overlay windows to exclude were ordered front only
+                // moments ago, and SCShareableContent snapshots can lag the
+                // window server — if we start before they're listed, the
+                // viewer sees the sharer's own indicator marks and strokes.
+                // Retry briefly until every excluded window is enumerable.
+                var content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
+                var attempts = 0
+                while attempts < 10,
+                      !self.excludedWindowIDs.isSubset(of: Set(content.windows.map(\.windowID))) {
+                    attempts += 1
+                    try await Task.sleep(nanoseconds: 100_000_000)
+                    content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
+                }
                 guard let display = content.displays.first else {
                     await MainActor.run { completion(false) }
                     return
                 }
                 let excluded = content.windows.filter { self.excludedWindowIDs.contains($0.windowID) }
+                if excluded.count != self.excludedWindowIDs.count {
+                    PWLog("screen share: only \(excluded.count)/\(self.excludedWindowIDs.count) overlay windows excludable after \(attempts) retries")
+                }
                 let filter = SCContentFilter(display: display, excludingWindows: excluded)
 
                 let config = SCStreamConfiguration()
@@ -55,7 +70,7 @@ final class ScreenShareCapture: NSObject, SCStreamOutput, SCStreamDelegate {
                 self.stream = stream
                 await MainActor.run { completion(true) }
             } catch {
-                NSLog("Pairwise: screen capture failed: \(error)")
+                PWLog("screen capture failed: \(error)")
                 await MainActor.run { completion(false) }
             }
         }
@@ -77,7 +92,7 @@ final class ScreenShareCapture: NSObject, SCStreamOutput, SCStreamDelegate {
     }
 
     func stream(_ stream: SCStream, didStopWithError error: Error) {
-        NSLog("Pairwise: screen stream stopped: \(error)")
+        PWLog("screen stream stopped: \(error)")
         self.stream = nil
         DispatchQueue.main.async { self.onStopped?() }
     }

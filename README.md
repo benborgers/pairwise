@@ -44,20 +44,15 @@ Updates ship via [Sparkle](https://sparkle-project.org): the app checks
 `appcast.xml` on the `main` branch and downloads the zip from the matching
 GitHub release.
 
-```sh
-./release.sh 1.1
-```
+Releases are automatic: every push to `main` runs the GitHub Actions
+`Release` workflow (`.github/workflows/release.yml`), which picks the next
+`1.N` version from the newest tag and runs `release.sh` on the runner —
+build, sign, notarize, staple, zip, EdDSA-sign the update, add an appcast
+entry, create the GitHub release, and push. Don't run `release.sh` locally.
 
-This builds, signs, notarizes, staples, zips, EdDSA-signs the update, adds an
-appcast entry, creates the GitHub release, and pushes. One-time setup:
-
-1. A "Developer ID Application" certificate in the keychain
-   (Xcode → Settings → Accounts → Manage Certificates → + → Developer ID Application).
-2. Notarization credentials:
-   `xcrun notarytool store-credentials pairwise-notary --apple-id <apple-id> --team-id <team-id>`
-   (create an app-specific password at appleid.apple.com).
-3. The Sparkle EdDSA private key in the login keychain
-   (`.build/artifacts/sparkle/Sparkle/bin/generate_keys`, already done on this machine).
+The workflow needs these repository secrets (documented at the top of
+`release.yml`): `DEVELOPER_ID_CERT_P12`, `DEVELOPER_ID_CERT_PASSWORD`,
+`APPLE_ID`, `APPLE_TEAM_ID`, `APPLE_APP_PASSWORD`, `SPARKLE_PRIVATE_KEY`.
 
 ## Using it
 

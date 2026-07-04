@@ -31,7 +31,10 @@ final class CameraCapture: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
         queue.async { [weak self] in
             guard let self else { return }
             self.generation += 1  // invalidate any pending watchdog
-            if self.session.isRunning { self.session.stopRunning() }
+            if self.session.isRunning {
+                self.session.stopRunning()
+                PWLog("camera capture stopped")
+            }
         }
     }
 
@@ -98,28 +101,50 @@ final class CameraCapture: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
 
     private func applyDevice(_ device: AVCaptureDevice) {
         session.beginConfiguration()
-        session.sessionPreset = .hd1280x720
         for input in session.inputs { session.removeInput(input) }
         if let input = try? AVCaptureDeviceInput(device: device), session.canAddInput(input) {
             session.addInput(input)
-            lockFrameRate(device)
+            configureFormat(device)
         } else {
             PWLog("could not create capture input for \(device.localizedName)")
         }
         session.commitConfiguration()
     }
 
-    /// In low light, auto-exposure stretches frame duration and the feed drops
-    /// to ~15 fps (visibly choppy). Cap exposure at 1/24 s so the stream never
-    /// falls below 24 fps; a slightly darker image beats a stuttering one.
-    private func lockFrameRate(_ device: AVCaptureDevice) {
+    /// Pin the device to a ~720p30 format. Session presets proved unreliable
+    /// here (both test machines delivered 1080p under .hd1280x720, starving
+    /// the encoder's bitrate budget), so pick the activeFormat explicitly.
+    /// Also cap auto-exposure at 1/24 s: in low light it otherwise stretches
+    /// frame duration and the feed visibly stutters.
+    private func configureFormat(_ device: AVCaptureDevice) {
+        let targetPixels = 1280 * 720
+        var best: AVCaptureDevice.Format?
+        var bestScore = Int.max
+        for format in device.formats {
+            let dims = CMVideoFormatDescriptionGetDimensions(format.formatDescription)
+            guard format.videoSupportedFrameRateRanges.contains(where: { $0.maxFrameRate >= 24 }) else { continue }
+            let pixels = Int(dims.width) * Int(dims.height)
+            // Prefer the closest pixel count to 720p, undersized only if
+            // nothing at or above the target exists.
+            let score = pixels >= targetPixels ? pixels - targetPixels
+                                               : (targetPixels - pixels) * 4
+            if score < bestScore {
+                bestScore = score
+                best = format
+            }
+        }
         do {
             try device.lockForConfiguration()
+            if let best {
+                device.activeFormat = best
+                let dims = CMVideoFormatDescriptionGetDimensions(best.formatDescription)
+                PWLog("camera format pinned to \(dims.width)x\(dims.height) on \(device.localizedName)")
+            }
             device.activeVideoMinFrameDuration = CMTime(value: 1, timescale: 30)
             device.activeVideoMaxFrameDuration = CMTime(value: 1, timescale: 24)
             device.unlockForConfiguration()
         } catch {
-            PWLog("could not lock frame rate on \(device.localizedName): \(error)")
+            PWLog("could not configure format on \(device.localizedName): \(error)")
         }
     }
 

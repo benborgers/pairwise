@@ -199,11 +199,16 @@ final class MediaTransport {
 
         // Drop frames older than what we've already delivered (with wraparound slack).
         if let last = lastDelivered[sKey], pkt.sequence <= last, last - pkt.sequence < 1 << 30 {
-            // A huge backward jump isn't a stale packet — it's a stream whose
-            // encoder was rebuilt mid-call (camera or screen share toggled
-            // back on), restarting its sequence at 0. Resync to the new
-            // sequence space instead of dropping video until it catches up.
-            guard last - pkt.sequence >= 1000 else { return }
+            // A large backward jump isn't a stale packet — it's a stream
+            // whose encoder was rebuilt and restarted its numbering (current
+            // senders carry sequences across rebuilds, but 1.3-and-earlier
+            // peers restart at 0). A keyframe far behind us is that restart's
+            // first frame; resync instead of dropping video until the new
+            // stream catches up. Small backward jumps stay treated as the
+            // reordered/duplicate packets they are.
+            let backward = last - pkt.sequence
+            guard backward >= 1000 || (pkt.isKeyframe && backward >= 30) else { return }
+            PWLog("stream \(sKey) sequence reset \(last) -> \(pkt.sequence); resyncing")
             reassembly[sKey] = nil
             lastDelivered[sKey] = nil
         }
