@@ -5,5 +5,13 @@
     <link>https://github.com/benborgers/pairwise</link>
     <language>en</language>
     <!-- releases -->
+    <item>
+      <title>1.1</title>
+      <pubDate>Sat, 04 Jul 2026 04:57:46 -0400</pubDate>
+      <sparkle:version>1.1</sparkle:version>
+      <sparkle:shortVersionString>1.1</sparkle:shortVersionString>
+      <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
+      <enclosure url="https://github.com/benborgers/pairwise/releases/download/v1.1/Pairwise-1.1.zip" sparkle:edSignature="StHrSU7uSzTUXesrhVK2VmbDaUtl12CMcwvjlHwGoc0zNDGJHDjGbGKCpUHlqlbZhKI4RC2CeVtbnDaiOS/gBQ==" length="1319457" type="application/octet-stream"/>
+    </item>
   </channel>
 </rss>

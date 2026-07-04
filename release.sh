@@ -52,7 +52,7 @@ ITEM="    <item>\\
 sed -i '' "s|    <!-- releases -->|    <!-- releases -->\\
 $ITEM|" appcast.xml
 
-echo "Creating GitHub release $TAG…"
+echo "Creating GitHub release ${TAG}..."
 gh release create "$TAG" "$ZIP" --repo "$REPO" --title "$VERSION" --notes ""
 
 git add appcast.xml
