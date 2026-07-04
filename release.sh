@@ -51,7 +51,13 @@ xcrun notarytool submit "$DMG" --keychain-profile "$NOTARY_PROFILE" --wait
 xcrun stapler staple "$DMG"
 
 echo "Signing update for Sparkle…"
-SIGNATURE=$("$SPARKLE_BIN/sign_update" "$DMG" | tr -d '\n')  # sparkle:edSignature="…" length="…"
+# The EdDSA key lives in the login keychain locally; CI passes it as a file
+# via SPARKLE_PRIVATE_KEY_FILE instead.
+if [[ -n "${SPARKLE_PRIVATE_KEY_FILE:-}" ]]; then
+  SIGNATURE=$("$SPARKLE_BIN/sign_update" -f "$SPARKLE_PRIVATE_KEY_FILE" "$DMG" | tr -d '\n')
+else
+  SIGNATURE=$("$SPARKLE_BIN/sign_update" "$DMG" | tr -d '\n')  # sparkle:edSignature="…" length="…"
+fi
 
 URL="https://github.com/$REPO/releases/download/$TAG/Pairwise-$VERSION.dmg"
 PUBDATE=$(date -R)
@@ -69,8 +75,9 @@ $ITEM|" appcast.xml
 echo "Creating GitHub release ${TAG}..."
 gh release create "$TAG" "$DMG" --repo "$REPO" --title "$VERSION" --notes ""
 
+# [skip ci] so the release workflow's own push doesn't trigger another release.
 git add appcast.xml
-git commit -m "Release $VERSION"
+git commit -m "Release $VERSION [skip ci]"
 git push
 
 echo

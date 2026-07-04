@@ -46,6 +46,7 @@ final class CallController {
     private(set) var micOn = true
     private(set) var sharingScreen = false
     private var remoteSharingScreen = false
+    private var remoteCameraOn = true
     private var remoteScreenAspect = 16.0 / 10.0
 
     init() {
@@ -230,6 +231,7 @@ final class CallController {
         screenViewer?.close()
         screenViewer = nil
         remoteSharingScreen = false
+        remoteCameraOn = true
 
         state = .idle
     }
@@ -273,6 +275,29 @@ final class CallController {
         }
     }
 
+    // MARK: - Device settings
+
+    /// The mic choice is applied when the audio engine is built, so a
+    /// mid-call change needs an engine rebuild.
+    func micDeviceChanged() {
+        guard case .inCall = state else { return }
+        audio.restart()
+    }
+
+    func cameraDeviceChanged() {
+        guard case .inCall = state, cameraOn else { return }
+        camera.stop()
+        cameraEncoder?.invalidate()
+        cameraEncoder = nil
+        startCamera()
+    }
+
+    func screenShareResolutionChanged() {
+        guard case .inCall = state, sharingScreen else { return }
+        stopScreenShareInternal()
+        startScreenShare()
+    }
+
     // MARK: - Camera pipeline
 
     private func startCamera() {
@@ -308,13 +333,6 @@ final class CallController {
         if let videoWindow { excluded.insert(videoWindow.windowID) }
         screenCapture.excludedWindowIDs = excluded
 
-        let encoder = VideoEncoder(config: .init(width: 2560, height: 1600, fps: 60,
-                                                 bitrate: 6_000_000, keyframeInterval: 4))
-        encoder.onEncodedFrame = { [weak self] data, key, seq, ts in
-            self?.transport.sendFrame(stream: .screen, isKeyframe: key,
-                                      sequence: seq, timestampUs: ts, data: data)
-        }
-        screenEncoder = encoder
         screenCapture.onPixelBuffer = { [weak self] pb, pts in
             self?.screenEncoder?.encode(pixelBuffer: pb, presentationTime: pts)
         }
@@ -328,6 +346,19 @@ final class CallController {
         screenCapture.start { [weak self] ok in
             guard let self else { return }
             if ok {
+                // The encoder matches what the stream actually captures
+                // (which follows the user's resolution setting), with bitrate
+                // tiered to the pixel count.
+                let size = self.screenCapture.capturedSize
+                let longSide = max(size.width, size.height)
+                let bitrate = longSide <= 1280 ? 2_500_000 : longSide <= 1920 ? 4_000_000 : 6_000_000
+                let encoder = VideoEncoder(config: .init(width: Int32(size.width), height: Int32(size.height),
+                                                         fps: 60, bitrate: bitrate, keyframeInterval: 4))
+                encoder.onEncodedFrame = { [weak self] data, key, seq, ts in
+                    self?.transport.sendFrame(stream: .screen, isKeyframe: key,
+                                              sequence: seq, timestampUs: ts, data: data)
+                }
+                self.screenEncoder = encoder
                 self.sharingScreen = true
                 self.sendLocalState()
                 self.refreshVideoWindowControls()
@@ -360,6 +391,7 @@ final class CallController {
     private func handleRemoteState(cameraOn: Bool, sharingScreen: Bool,
                                    screenAspect: Double, peerName: String) {
         PWLog("remote state: camera=\(cameraOn) screen=\(sharingScreen) aspect=\(String(format: "%.2f", screenAspect))")
+        remoteCameraOn = cameraOn
         if !cameraOn { videoWindow?.setCameraOff() }
         remoteScreenAspect = screenAspect
 
@@ -408,6 +440,9 @@ final class CallController {
             case .audio:
                 self.audio.playReceived(frame.data)
             case .camera:
+                // Frames still in flight after the peer said "camera off"
+                // would re-hide the placeholder and leave a frozen last frame.
+                guard self.remoteCameraOn else { return }
                 self.handleVideoFrame(frame, unpacker: self.cameraUnpacker,
                                       lastSeq: &self.lastCameraSeq) { sb in
                     DispatchQueue.main.async { self.videoWindow?.enqueue(sb) }

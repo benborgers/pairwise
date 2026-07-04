@@ -28,13 +28,21 @@ final class ScreenShareCapture: NSObject, SCStreamOutput, SCStreamDelegate {
                 let filter = SCContentFilter(display: display, excludingWindows: excluded)
 
                 let config = SCStreamConfiguration()
-                // Native pixel resolution, capped to keep the encoder happy.
-                let scale = display.width > 2560 ? 2560.0 / Double(display.width) : 1.0
+                // Native pixel resolution, downscaled proportionally to the
+                // user's chosen long-side cap (0 = native) and the encoder's
+                // hard ceiling.
                 let pxScale = filter.pointPixelScale > 0 ? Double(filter.pointPixelScale) : 2.0
-                let w = Int(Double(display.width) * pxScale * scale)
-                let h = Int(Double(display.height) * pxScale * scale)
-                config.width = min(w, 3840) & ~1
-                config.height = min(h, 2160) & ~1
+                var w = Double(display.width) * pxScale
+                var h = Double(display.height) * pxScale
+                let cap = DeviceSettings.screenShareMaxDimension
+                let limit = cap > 0 ? Double(min(cap, 3840)) : 3840.0
+                if max(w, h) > limit {
+                    let s = limit / max(w, h)
+                    w *= s
+                    h *= s
+                }
+                config.width = Int(w) & ~1
+                config.height = Int(h) & ~1
                 config.minimumFrameInterval = CMTime(value: 1, timescale: 60)
                 config.pixelFormat = kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
                 config.queueDepth = 5

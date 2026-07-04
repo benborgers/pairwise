@@ -1,5 +1,6 @@
 import Foundation
 import AVFoundation
+import AudioToolbox
 import PWShim
 
 /// Full-duplex voice pipeline: an AVAudioEngine (built fresh for every call)
@@ -213,6 +214,8 @@ final class AudioPipeline {
             }
         }
 
+        applyPreferredInputDevice(engine)
+
         let inputFormat = engine.inputNode.outputFormat(forBus: 0)
         guard inputFormat.sampleRate > 0, inputFormat.channelCount > 0 else {
             NSLog("Pairwise: no usable audio input (format \(inputFormat))")
@@ -260,6 +263,41 @@ final class AudioPipeline {
         self.player = player
         running = true
         return true
+    }
+
+    /// Points the engine's input at the user-chosen mic. Must run before the
+    /// input format is read or the engine starts. Any failure (device
+    /// unplugged, property rejected) falls back to the system default input.
+    private func applyPreferredInputDevice(_ engine: AVAudioEngine) {
+        guard let uid = DeviceSettings.micUID else { return }
+        guard let device = AudioInputDevices.all().first(where: { $0.uid == uid }) else {
+            PWLog("preferred mic \(uid) not connected; using system default")
+            return
+        }
+        guard let unit = engine.inputNode.audioUnit else { return }
+        var deviceID = device.id
+        let err = AudioUnitSetProperty(unit, kAudioOutputUnitProperty_CurrentDevice,
+                                       kAudioUnitScope_Global, 0, &deviceID,
+                                       UInt32(MemoryLayout<AudioDeviceID>.size))
+        if err == noErr {
+            PWLog("mic: \(device.name)")
+        } else {
+            PWLog("could not select mic '\(device.name)' (err \(err)); using system default")
+        }
+    }
+
+    /// Tears down and rebuilds the engine (e.g. after the user picks a
+    /// different mic mid-call). The 1 s gap mirrors the AEC watchdog: a
+    /// replacement engine started immediately after teardown inherits a
+    /// starved input from coreaudiod.
+    func restart() {
+        guard running else { return }
+        stop()
+        let generation = lifecycleGeneration
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
+            guard let self, self.lifecycleGeneration == generation, !self.running else { return }
+            self.start()
+        }
     }
 
     private func setUpCodecs() {

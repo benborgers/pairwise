@@ -33,7 +33,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
         if let button = statusItem.button {
-            button.image = NSImage(systemSymbolName: "person.2.fill", accessibilityDescription: "Pairwise")
+            button.image = MenuBarIcon.pear
         }
         let menu = NSMenu()
         menu.delegate = self
@@ -57,13 +57,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func refreshStatusIcon() {
-        let symbol: String
         switch callController.state {
-        case .idle: symbol = "person.2.fill"
-        case .dialing, .ringing: symbol = "phone.badge.waveform.fill"
-        case .inCall: symbol = "phone.connection.fill"
+        case .idle:
+            statusItem.button?.image = MenuBarIcon.pear
+        case .dialing, .ringing:
+            statusItem.button?.image = NSImage(systemSymbolName: "phone.badge.waveform.fill",
+                                               accessibilityDescription: "Pairwise")
+        case .inCall:
+            statusItem.button?.image = NSImage(systemSymbolName: "phone.connection.fill",
+                                               accessibilityDescription: "Pairwise")
         }
-        statusItem.button?.image = NSImage(systemSymbolName: symbol, accessibilityDescription: "Pairwise")
     }
 
     // MARK: - Menu
@@ -128,22 +131,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                     item.representedObject = peer.id
                     menu.addItem(item)
                     presenceItems[peer.host] = item
+
+                    // Holding ⌥ flips the call line into a remove action.
+                    let remove = NSMenuItem(title: "Remove \(peer.name)", action: #selector(removePeer(_:)), keyEquivalent: "")
+                    remove.target = self
+                    remove.representedObject = peer.id
+                    remove.isAlternate = true
+                    remove.keyEquivalentModifierMask = .option
+                    remove.image = NSImage(systemSymbolName: "trash", accessibilityDescription: nil)
+                    menu.addItem(remove)
                 }
                 PresenceStore.shared.refresh(hosts: peers.map(\.host))
                 menu.addItem(.separator())
-                let removeMenu = NSMenu()
-                for peer in peers {
-                    let item = NSMenuItem(title: "\(peer.name) (\(peer.host))", action: #selector(removePeer(_:)), keyEquivalent: "")
-                    item.target = self
-                    item.representedObject = peer.id
-                    removeMenu.addItem(item)
-                }
-                let removeItem = NSMenuItem(title: "Remove Peer", action: nil, keyEquivalent: "")
-                removeItem.submenu = removeMenu
-                menu.addItem(removeItem)
             }
             menu.addItem(makeItem(title: "Add Peer…", symbol: "plus", action: #selector(addPeer)))
         }
+
+        menu.addItem(.separator())
+        menu.addItem(microphoneItem())
+        menu.addItem(cameraItem())
+        menu.addItem(shareResolutionItem())
 
         menu.addItem(.separator())
         let update = NSMenuItem(title: "Check for Updates…", action: #selector(checkForUpdates), keyEquivalent: "")
@@ -159,6 +166,90 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         item.target = self
         item.image = NSImage(systemSymbolName: symbol, accessibilityDescription: nil)
         return item
+    }
+
+    // MARK: - Device settings menus
+
+    private func microphoneItem() -> NSMenuItem {
+        let sub = NSMenu()
+        let selected = DeviceSettings.micUID
+        let def = NSMenuItem(title: "System Default", action: #selector(selectMic(_:)), keyEquivalent: "")
+        def.target = self
+        def.state = selected == nil ? .on : .off
+        sub.addItem(def)
+        let devices = AudioInputDevices.all()
+        if !devices.isEmpty { sub.addItem(.separator()) }
+        for device in devices {
+            let item = NSMenuItem(title: device.name, action: #selector(selectMic(_:)), keyEquivalent: "")
+            item.target = self
+            item.representedObject = device.uid
+            item.state = selected == device.uid ? .on : .off
+            sub.addItem(item)
+        }
+        let root = NSMenuItem(title: "Microphone", action: nil, keyEquivalent: "")
+        root.image = NSImage(systemSymbolName: "mic", accessibilityDescription: nil)
+        root.submenu = sub
+        return root
+    }
+
+    private func cameraItem() -> NSMenuItem {
+        let sub = NSMenu()
+        let selected = DeviceSettings.cameraUID
+        let auto = NSMenuItem(title: "Automatic", action: #selector(selectCamera(_:)), keyEquivalent: "")
+        auto.target = self
+        auto.state = selected == nil ? .on : .off
+        sub.addItem(auto)
+        let cameras = CameraCapture.availableCameras()
+        if !cameras.isEmpty { sub.addItem(.separator()) }
+        for camera in cameras {
+            let item = NSMenuItem(title: camera.name, action: #selector(selectCamera(_:)), keyEquivalent: "")
+            item.target = self
+            item.representedObject = camera.uid
+            item.state = selected == camera.uid ? .on : .off
+            sub.addItem(item)
+        }
+        let root = NSMenuItem(title: "Camera", action: nil, keyEquivalent: "")
+        root.image = NSImage(systemSymbolName: "video", accessibilityDescription: nil)
+        root.submenu = sub
+        return root
+    }
+
+    private static let shareResolutionChoices: [(title: String, cap: Int)] = [
+        ("Native", 0),
+        ("High (2560 px)", 2560),
+        ("Medium (1920 px)", 1920),
+        ("Low (1280 px)", 1280),
+    ]
+
+    private func shareResolutionItem() -> NSMenuItem {
+        let sub = NSMenu()
+        let selected = DeviceSettings.screenShareMaxDimension
+        for choice in Self.shareResolutionChoices {
+            let item = NSMenuItem(title: choice.title, action: #selector(selectShareResolution(_:)), keyEquivalent: "")
+            item.target = self
+            item.representedObject = choice.cap
+            item.state = selected == choice.cap ? .on : .off
+            sub.addItem(item)
+        }
+        let root = NSMenuItem(title: "Screen Share Resolution", action: nil, keyEquivalent: "")
+        root.image = NSImage(systemSymbolName: "rectangle.inset.filled", accessibilityDescription: nil)
+        root.submenu = sub
+        return root
+    }
+
+    @objc private func selectMic(_ sender: NSMenuItem) {
+        DeviceSettings.micUID = sender.representedObject as? String
+        callController.micDeviceChanged()
+    }
+
+    @objc private func selectCamera(_ sender: NSMenuItem) {
+        DeviceSettings.cameraUID = sender.representedObject as? String
+        callController.cameraDeviceChanged()
+    }
+
+    @objc private func selectShareResolution(_ sender: NSMenuItem) {
+        DeviceSettings.screenShareMaxDimension = (sender.representedObject as? Int) ?? 2560
+        callController.screenShareResolutionChanged()
     }
 
     // MARK: - Actions

@@ -1,0 +1,76 @@
+# Cut a release on every push to main: the next 1.N version is derived from
+# the newest v1.* tag and passed to release.sh (build → sign → notarize →
+# GitHub release → appcast commit, which carries [skip ci] so this workflow
+# doesn't retrigger itself).
+#
+# Required repository secrets:
+#   DEVELOPER_ID_CERT_P12       Developer ID Application cert + key, .p12, base64-encoded
+#   DEVELOPER_ID_CERT_PASSWORD  password for the .p12
+#   APPLE_ID                    Apple ID email for notarization
+#   APPLE_TEAM_ID               Apple Developer team ID
+#   APPLE_APP_PASSWORD          app-specific password for notarytool
+#   SPARKLE_PRIVATE_KEY         Sparkle EdDSA private key (generate_keys -x output)
+name: Release
+
+on:
+  push:
+    branches: [main]
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: macos-15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # full history so version tags are visible
+
+      - name: Import Developer ID certificate
+        env:
+          CERT_P12: ${{ secrets.DEVELOPER_ID_CERT_P12 }}
+          CERT_PASSWORD: ${{ secrets.DEVELOPER_ID_CERT_PASSWORD }}
+        run: |
+          KEYCHAIN_PASSWORD=$(uuidgen)
+          security create-keychain -p "$KEYCHAIN_PASSWORD" build.keychain
+          security default-keychain -s build.keychain
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" build.keychain
+          security set-keychain-settings -lut 21600 build.keychain
+          echo "$CERT_P12" | base64 -d > cert.p12
+          security import cert.p12 -k build.keychain -P "$CERT_PASSWORD" -T /usr/bin/codesign
+          rm cert.p12
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PASSWORD" build.keychain
+
+      - name: Store notarization credentials
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+        run: |
+          xcrun notarytool store-credentials pairwise-notary \
+            --apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" --password "$APPLE_APP_PASSWORD"
+
+      - name: Write Sparkle signing key
+        env:
+          SPARKLE_PRIVATE_KEY: ${{ secrets.SPARKLE_PRIVATE_KEY }}
+        run: |
+          KEY_FILE="$RUNNER_TEMP/sparkle_ed25519"
+          printf '%s' "$SPARKLE_PRIVATE_KEY" > "$KEY_FILE"
+          echo "SPARKLE_PRIVATE_KEY_FILE=$KEY_FILE" >> "$GITHUB_ENV"
+
+      - name: Determine next version
+        run: |
+          LATEST=$(git tag -l 'v1.*' | sed 's/^v1\.//' | sort -n | tail -1)
+          echo "VERSION=1.$(( ${LATEST:-0} + 1 ))" >> "$GITHUB_ENV"
+
+      - name: Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          ./release.sh "$VERSION"

@@ -49,8 +49,21 @@ final class CameraCapture: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
         if devices.isEmpty, let fallback = AVCaptureDevice.default(for: .video) {
             devices = [fallback]
         }
+        // The user's chosen camera leads; the watchdog still rotates onward
+        // if it turns out to deliver no frames.
+        if let uid = DeviceSettings.cameraUID,
+           let idx = devices.firstIndex(where: { $0.uniqueID == uid }) {
+            devices.insert(devices.remove(at: idx), at: 0)
+        }
         candidates = devices
         candidateIndex = 0
+    }
+
+    static func availableCameras() -> [(name: String, uid: String)] {
+        let discovery = AVCaptureDevice.DiscoverySession(
+            deviceTypes: [.builtInWideAngleCamera, .continuityCamera, .external],
+            mediaType: .video, position: .unspecified)
+        return discovery.devices.map { ($0.localizedName, $0.uniqueID) }
     }
 
     private func configureAndRun() {

@@ -199,7 +199,13 @@ final class MediaTransport {
 
         // Drop frames older than what we've already delivered (with wraparound slack).
         if let last = lastDelivered[sKey], pkt.sequence <= last, last - pkt.sequence < 1 << 30 {
-            return
+            // A huge backward jump isn't a stale packet — it's a stream whose
+            // encoder was rebuilt mid-call (camera or screen share toggled
+            // back on), restarting its sequence at 0. Resync to the new
+            // sequence space instead of dropping video until it catches up.
+            guard last - pkt.sequence >= 1000 else { return }
+            reassembly[sKey] = nil
+            lastDelivered[sKey] = nil
         }
 
         let fragCount = Int(pkt.fragmentCount)
