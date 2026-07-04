@@ -6,6 +6,14 @@
     <language>en</language>
     <!-- releases -->
     <item>
+      <title>1.5</title>
+      <pubDate>Sat, 04 Jul 2026 23:59:05 +0000</pubDate>
+      <sparkle:version>1.5</sparkle:version>
+      <sparkle:shortVersionString>1.5</sparkle:shortVersionString>
+      <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
+      <enclosure url="https://github.com/benborgers/pairwise/releases/download/v1.5/Pairwise-1.5.dmg" sparkle:edSignature="GKRI6E6l0Lv1EKAwrQN1UDSqWa75znQajw+8tx43a+nXnXWPEA9Rwx2P7mFFFx9vxKo4ykbiE3ECaKT/ug4bDw==" length="1582421" type="application/octet-stream"/>
+    </item>
+    <item>
       <title>1.4</title>
       <pubDate>Sat, 04 Jul 2026 23:23:43 +0000</pubDate>
       <sparkle:version>1.4</sparkle:version>
