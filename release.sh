@@ -10,7 +10,14 @@
 #         --apple-id benborgers@hey.com --team-id <TEAMID>
 #   - The Sparkle EdDSA private key in the login keychain (generate_keys).
 #
-# Steps: build + sign → notarize + staple → zip → sign update → add appcast
+# Ships a DMG rather than a zip: zips of the app were mangled by Archive
+# Utility (xattrs on Sparkle's symlinks materialized as ._* AppleDouble files
+# inside the framework, which Gatekeeper rejects as unsealed contents). A DMG
+# needs no extraction and gives users the drag-to-Applications flow, which
+# also clears quarantine properly so Sparkle isn't blocked by app
+# translocation. Sparkle 2 installs updates from DMGs natively.
+#
+# Steps: build + sign → dmg → notarize + staple → sign update → add appcast
 # entry → create GitHub release → commit & push appcast.
 set -euo pipefail
 cd "$(dirname "$0")"
@@ -19,27 +26,34 @@ VERSION="${1:?usage: ./release.sh <version>}"
 NOTARY_PROFILE="${NOTARY_PROFILE:-pairwise-notary}"
 REPO="benborgers/pairwise"
 TAG="v$VERSION"
-ZIP="build/Pairwise-$VERSION.zip"
+DMG="build/Pairwise-$VERSION.dmg"
 SPARKLE_BIN=".build/artifacts/sparkle/Sparkle/bin"
 
-security find-identity -v -p codesigning | grep -q "Developer ID Application" \
+IDENTITY=$(security find-identity -v -p codesigning 2>/dev/null \
+  | grep -o '"Developer ID Application: [^"]*"' | head -1 | tr -d '"' || true)
+[[ -n "$IDENTITY" ]] \
   || { echo "error: no Developer ID Application identity in keychain"; exit 1; }
 
 VERSION="$VERSION" ./build.sh
 
-echo "Notarizing…"
-ditto -c -k --keepParent build/Pairwise.app "$ZIP"
-xcrun notarytool submit "$ZIP" --keychain-profile "$NOTARY_PROFILE" --wait
-xcrun stapler staple build/Pairwise.app
+echo "Creating DMG…"
+STAGING=build/dmg-staging
+rm -rf "$STAGING" "$DMG"
+mkdir -p "$STAGING"
+cp -R build/Pairwise.app "$STAGING/"
+ln -s /Applications "$STAGING/Applications"
+hdiutil create -volname "Pairwise" -srcfolder "$STAGING" -format UDZO "$DMG"
+rm -rf "$STAGING"
+codesign -f --timestamp -s "$IDENTITY" "$DMG"
 
-# Re-zip so the stapled ticket ships in the download.
-rm -f "$ZIP"
-ditto -c -k --keepParent build/Pairwise.app "$ZIP"
+echo "Notarizing…"
+xcrun notarytool submit "$DMG" --keychain-profile "$NOTARY_PROFILE" --wait
+xcrun stapler staple "$DMG"
 
 echo "Signing update for Sparkle…"
-SIGNATURE=$("$SPARKLE_BIN/sign_update" "$ZIP" | tr -d '\n')  # sparkle:edSignature="…" length="…"
+SIGNATURE=$("$SPARKLE_BIN/sign_update" "$DMG" | tr -d '\n')  # sparkle:edSignature="…" length="…"
 
-URL="https://github.com/$REPO/releases/download/$TAG/Pairwise-$VERSION.zip"
+URL="https://github.com/$REPO/releases/download/$TAG/Pairwise-$VERSION.dmg"
 PUBDATE=$(date -R)
 ITEM="    <item>\\
       <title>$VERSION</title>\\
@@ -53,7 +67,7 @@ sed -i '' "s|    <!-- releases -->|    <!-- releases -->\\
 $ITEM|" appcast.xml
 
 echo "Creating GitHub release ${TAG}..."
-gh release create "$TAG" "$ZIP" --repo "$REPO" --title "$VERSION" --notes ""
+gh release create "$TAG" "$DMG" --repo "$REPO" --title "$VERSION" --notes ""
 
 git add appcast.xml
 git commit -m "Release $VERSION"

@@ -20,8 +20,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             pipeline.onEncodedFrame = { _, _, _ in frames += 1 }
             pipeline.start()
             selfTestPipeline = pipeline
-            DispatchQueue.main.asyncAfter(deadline: .now() + 4) {
-                let result = "AUDIO_SELFTEST: \(frames) encoded frames, \(pipeline.debugTapCount) tap callbacks in 4s"
+            // 8s: long enough for the AEC watchdog (2.5s after engine start)
+            // to fire and the fallback engine to accumulate audible capture.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 8) {
+                let result = "AUDIO_SELFTEST: \(frames) encoded frames, \(pipeline.debugTapCount) tap callbacks, capture rms \(String(format: "%.6f", pipeline.debugCaptureRMS)) in 8s"
                 NSLog("Pairwise: %@", result)
                 try? result.write(toFile: "/tmp/pairwise_selftest.txt", atomically: true, encoding: .utf8)
                 pipeline.stop()

@@ -36,6 +36,9 @@ final class AudioPipeline {
 
     private var sequence: UInt32 = 0
     private var running = false
+    // Bumped on stop() so delayed watchdog work from an earlier call knows
+    // the pipeline was stopped and must not restart audio.
+    private var lifecycleGeneration = 0
     var micEnabled = true
 
     var onEncodedFrame: ((_ data: Data, _ sequence: UInt32, _ timestampUs: UInt64) -> Void)?
@@ -127,7 +130,8 @@ final class AudioPipeline {
     private func startEngine() {
         // Probe runs here on the pipeline queue (it blocks on the child
         // process); the engine itself is built on the main thread.
-        let mode: VoiceProcessingMode = Self.voiceProcessingWorks() ? .inputOnly : .off
+        let forceOff = ProcessInfo.processInfo.environment["PAIRWISE_FORCE_NO_AEC"] == "1"
+        let mode: VoiceProcessingMode = (!forceOff && Self.voiceProcessingWorks()) ? .inputOnly : .off
         DispatchQueue.main.async { [weak self] in self?.startEngineOnMain(mode: mode) }
     }
 
@@ -136,6 +140,7 @@ final class AudioPipeline {
         setUpCodecs()
         if attemptStart(mode: mode) {
             PWLog("audio running (\(mode.rawValue))")
+            if mode == .inputOnly { scheduleAECWatchdog() }
             return
         }
         if mode == .inputOnly {
@@ -150,9 +155,54 @@ final class AudioPipeline {
         }
     }
 
+    // The voice-processing unit can start cleanly yet deliver no input at all
+    // (wedged CoreAudio voice-processing state — the engine runs, the tap never
+    // fires). If nothing has been captured shortly after start, trade AEC for
+    // a working call.
+    private func scheduleAECWatchdog() {
+        let engineAtStart = engine
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) { [weak self] in
+            guard let self, self.running, self.engine === engineAtStart else { return }
+            let dead = self.debugTapCount == 0 ||
+                (self.micEnabled && self.debugSampleCount > 0 && self.debugSumSquares == 0)
+            guard dead else { return }
+            PWLog("AEC engine started but captured nothing; retrying without AEC")
+            Self.vpBrokenThisProcess = true
+            Self.probedVPWorks = false
+            let old = self.engine
+            let oldPlayer = self.player
+            self.engine = nil
+            self.player = nil
+            self.running = false
+            if let old {
+                _ = PWTryCatch({
+                    old.inputNode.removeTap(onBus: 0)
+                    oldPlayer?.stop()
+                    old.stop()
+                }, nil)
+            }
+            // Give the dead voice-processing unit a moment to finish tearing
+            // down in coreaudiod; starting the replacement engine immediately
+            // leaves it starved the same way.
+            let generation = self.lifecycleGeneration
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
+                guard let self, self.lifecycleGeneration == generation,
+                      !self.running, self.engine == nil else { return }
+                if self.attemptStart(mode: .off) {
+                    PWLog("audio running (no AEC)")
+                } else {
+                    PWLog("audio unavailable; call continues without audio")
+                }
+            }
+        }
+    }
+
     private func attemptStart(mode: VoiceProcessingMode) -> Bool {
         let engine = AVAudioEngine()
         let player = AVAudioPlayerNode()
+        debugTapCount = 0
+        debugSumSquares = 0
+        debugSampleCount = 0
 
         if mode != .off {
             do {
@@ -235,6 +285,7 @@ final class AudioPipeline {
     }
 
     func stop() {
+        lifecycleGeneration += 1
         let engine = self.engine
         let player = self.player
         self.engine = nil
@@ -256,19 +307,32 @@ final class AudioPipeline {
     // MARK: - Capture → encode → wire
 
     private(set) var debugTapCount = 0
+    private var debugSumSquares = 0.0
+    private var debugSampleCount = 0
+    /// RMS of all captured (post-conversion) samples — 0 means the mic path
+    /// is producing pure silence even if frames are flowing.
+    var debugCaptureRMS: Double {
+        debugSampleCount > 0 ? (debugSumSquares / Double(debugSampleCount)).squareRoot() : 0
+    }
     private func handleCaptured(_ buffer: AVAudioPCMBuffer) {
         debugTapCount += 1
         guard running, micEnabled else { return }
 
-        if inputConverter == nil || inputConverterSourceFormat != buffer.format {
-            inputConverter = AVAudioConverter(from: buffer.format, to: workFormat)
-            inputConverterSourceFormat = buffer.format
+        // The voice-processing unit can deliver the full device channel layout
+        // (9 channels on some Macs) with the mic signal in only one channel.
+        // AVAudioConverter's default multichannel→mono mapping yields silence
+        // for those buffers, so downmix explicitly before converting.
+        let source = downmixToMono(buffer) ?? buffer
+
+        if inputConverter == nil || inputConverterSourceFormat != source.format {
+            inputConverter = AVAudioConverter(from: source.format, to: workFormat)
+            inputConverterSourceFormat = source.format
             pending.removeAll()
         }
         guard let converter = inputConverter else { return }
 
-        let ratio = workFormat.sampleRate / buffer.format.sampleRate
-        let capacity = AVAudioFrameCount(Double(buffer.frameLength) * ratio) + 16
+        let ratio = workFormat.sampleRate / source.format.sampleRate
+        let capacity = AVAudioFrameCount(Double(source.frameLength) * ratio) + 16
         guard let converted = AVAudioPCMBuffer(pcmFormat: workFormat, frameCapacity: capacity) else { return }
         var fed = false
         var error: NSError?
@@ -276,9 +340,15 @@ final class AudioPipeline {
             if fed { outStatus.pointee = .noDataNow; return nil }
             fed = true
             outStatus.pointee = .haveData
-            return buffer
+            return source
         }
         guard error == nil, converted.frameLength > 0, let ch = converted.floatChannelData else { return }
+
+        for i in 0..<Int(converted.frameLength) {
+            let s = Double(ch[0][i])
+            debugSumSquares += s * s
+        }
+        debugSampleCount += Int(converted.frameLength)
 
         pending.append(contentsOf: UnsafeBufferPointer(start: ch[0], count: Int(converted.frameLength)))
 
@@ -287,6 +357,39 @@ final class AudioPipeline {
             pending.removeFirst(samplesPerFrame)
             encodeAndEmit(frame)
         }
+    }
+
+    private func downmixToMono(_ buffer: AVAudioPCMBuffer) -> AVAudioPCMBuffer? {
+        guard buffer.format.channelCount > 1, buffer.frameLength > 0,
+              let ch = buffer.floatChannelData,
+              let fmt = AVAudioFormat(commonFormat: .pcmFormatFloat32,
+                                      sampleRate: buffer.format.sampleRate,
+                                      channels: 1, interleaved: false),
+              let mono = AVAudioPCMBuffer(pcmFormat: fmt, frameCapacity: buffer.frameLength)
+        else { return nil }
+        let frames = Int(buffer.frameLength)
+        // Average only channels carrying signal: unused slots in the VP unit's
+        // channel layout are digital silence, and mixing them in would just
+        // attenuate the one live mic channel.
+        var live = [UnsafeMutablePointer<Float>]()
+        for c in 0..<Int(buffer.format.channelCount) {
+            var energy: Float = 0
+            for i in 0..<frames { energy += ch[c][i] * ch[c][i] }
+            if energy > 0 { live.append(ch[c]) }
+        }
+        mono.frameLength = buffer.frameLength
+        let out = mono.floatChannelData![0]
+        if live.isEmpty {
+            for i in 0..<frames { out[i] = 0 }
+        } else {
+            let scale = 1 / Float(live.count)
+            for i in 0..<frames {
+                var s: Float = 0
+                for c in live { s += c[i] }
+                out[i] = s * scale
+            }
+        }
+        return mono
     }
 
     private func encodeAndEmit(_ samples: [Float]) {
