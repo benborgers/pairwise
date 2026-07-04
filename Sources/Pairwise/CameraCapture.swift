@@ -89,10 +89,25 @@ final class CameraCapture: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
         for input in session.inputs { session.removeInput(input) }
         if let input = try? AVCaptureDeviceInput(device: device), session.canAddInput(input) {
             session.addInput(input)
+            lockFrameRate(device)
         } else {
             PWLog("could not create capture input for \(device.localizedName)")
         }
         session.commitConfiguration()
+    }
+
+    /// In low light, auto-exposure stretches frame duration and the feed drops
+    /// to ~15 fps (visibly choppy). Cap exposure at 1/24 s so the stream never
+    /// falls below 24 fps; a slightly darker image beats a stuttering one.
+    private func lockFrameRate(_ device: AVCaptureDevice) {
+        do {
+            try device.lockForConfiguration()
+            device.activeVideoMinFrameDuration = CMTime(value: 1, timescale: 30)
+            device.activeVideoMaxFrameDuration = CMTime(value: 1, timescale: 24)
+            device.unlockForConfiguration()
+        } catch {
+            PWLog("could not lock frame rate on \(device.localizedName): \(error)")
+        }
     }
 
     /// If the running device produces no frames, rotate to the next one.

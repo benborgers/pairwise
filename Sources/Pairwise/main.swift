@@ -4,6 +4,7 @@ import Sparkle
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var statusItem: NSStatusItem!
     private let callController = CallController()
+    private var presenceItems: [String: NSMenuItem] = [:]  // peer host → menu line
     private let updaterController = SPUStandardUpdaterController(
         startingUpdater: true, updaterDelegate: nil, userDriverDelegate: nil)
 
@@ -40,6 +41,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             self?.refreshStatusIcon()
         }
 
+        // Presence results land asynchronously while the menu is open;
+        // repaint the dots in place.
+        PresenceStore.shared.onChanged = { [weak self] in
+            guard let self else { return }
+            for (host, item) in self.presenceItems {
+                item.image = Self.presenceDot(online: PresenceStore.shared.online[host])
+            }
+        }
+
         // Warm the voice-processing probe so call audio starts instantly.
         DispatchQueue.global(qos: .utility).async { AudioPipeline.warmUpProbe() }
     }
@@ -56,8 +66,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     // MARK: - Menu
 
+    private static func presenceDot(online: Bool?) -> NSImage? {
+        let config = NSImage.SymbolConfiguration(pointSize: 8, weight: .regular)
+            .applying(.init(paletteColors: [online == true ? .systemGreen : .systemGray]))
+        return NSImage(systemSymbolName: "circle.fill",
+                       accessibilityDescription: online == true ? "Online" : "Offline")?
+            .withSymbolConfiguration(config)
+    }
+
     func menuNeedsUpdate(_ menu: NSMenu) {
         menu.removeAllItems()
+        presenceItems.removeAll()
 
         switch callController.state {
         case .inCall(let peerName):
@@ -103,10 +122,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 for peer in peers {
                     let item = NSMenuItem(title: "Call \(peer.name)", action: #selector(callPeer(_:)), keyEquivalent: "")
                     item.target = self
-                    item.image = NSImage(systemSymbolName: "phone.fill", accessibilityDescription: nil)
+                    item.image = Self.presenceDot(online: PresenceStore.shared.online[peer.host])
                     item.representedObject = peer.id
                     menu.addItem(item)
+                    presenceItems[peer.host] = item
                 }
+                PresenceStore.shared.refresh(hosts: peers.map(\.host))
                 menu.addItem(.separator())
                 let removeMenu = NSMenu()
                 for peer in peers {

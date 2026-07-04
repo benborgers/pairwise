@@ -63,6 +63,7 @@ final class AudioPipeline {
     // the app process only ever attempts a configuration known to work.
 
     private static var probedVPWorks: Bool?
+    private static var vpBrokenThisProcess = false
     private static let vpBrokenKey = "pairwise.vpBroken"
 
     /// Run the probe ahead of time (at app launch) so the first call doesn't
@@ -82,7 +83,10 @@ final class AudioPipeline {
                                     channels: 1, interleaved: false)!
             _ = PWTryCatch({
                 engine.attach(player)
-                engine.connect(player, to: engine.mainMixerNode, format: fmt)
+                // Player goes straight to outputNode: touching mainMixerNode
+                // after enabling voice processing breaks output unit init
+                // (-10875), and the VP output unit is the AEC reference anyway.
+                engine.connect(player, to: engine.outputNode, format: fmt)
                 engine.inputNode.installTap(onBus: 0, bufferSize: 960, format: nil) { _, _ in }
                 engine.prepare()
                 do { try engine.start(); ok = true } catch {}
@@ -94,7 +98,11 @@ final class AudioPipeline {
 
     private static func voiceProcessingWorks() -> Bool {
         if let cached = probedVPWorks { return cached }
-        if UserDefaults.standard.bool(forKey: vpBrokenKey) { probedVPWorks = false; return false }
+        // A failed real start only poisons THIS process's CoreAudio state, so
+        // the broken flag must not outlive the launch. Clear anything an older
+        // build persisted so AEC gets retried.
+        UserDefaults.standard.removeObject(forKey: vpBrokenKey)
+        if vpBrokenThisProcess { probedVPWorks = false; return false }
         guard let exe = Bundle.main.executablePath else { probedVPWorks = false; return false }
         let child = Process()
         child.executableURL = URL(fileURLWithPath: exe)
@@ -133,9 +141,10 @@ final class AudioPipeline {
         if mode == .inputOnly {
             // The probe passed but the real start failed; the process is now
             // poisoned, so a fallback attempt would fail too. Remember the
-            // failure so the NEXT call goes straight to no-AEC audio.
-            UserDefaults.standard.set(true, forKey: Self.vpBrokenKey)
-            PWLog("AEC engine failed despite probe; this call has no audio, future calls will skip AEC")
+            // failure so the next call THIS LAUNCH goes straight to no-AEC audio.
+            Self.vpBrokenThisProcess = true
+            Self.probedVPWorks = false
+            PWLog("AEC engine failed despite probe; this call has no audio, calls after relaunch will skip AEC")
         } else {
             PWLog("audio unavailable; call continues without audio")
         }
@@ -170,7 +179,9 @@ final class AudioPipeline {
         var started = false
         let ok = PWTryCatch({
             engine.attach(player)
-            engine.connect(player, to: engine.mainMixerNode, format: self.workFormat)
+            // Straight to outputNode — see runVoiceProcessingProbe for why
+            // mainMixerNode must not be touched with voice processing on.
+            engine.connect(player, to: engine.outputNode, format: self.workFormat)
             engine.inputNode.installTap(onBus: 0, bufferSize: 960, format: nil) { [weak self] buffer, _ in
                 self?.queue.async { self?.handleCaptured(buffer) }
             }

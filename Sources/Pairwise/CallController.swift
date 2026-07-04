@@ -39,6 +39,7 @@ final class CallController {
     private var outgoingWindow: OutgoingCallWindow?
     private var screenViewer: ScreenViewerWindow?
     private var annotationOverlay: AnnotationOverlayWindow?
+    private var shareIndicator: ScreenShareIndicatorWindow?
 
     // Local toggles
     private(set) var cameraOn = true
@@ -72,7 +73,7 @@ final class CallController {
                     guard case .dialing = self.state else { channel.close(); return }
                     self.control = channel
                     self.wireControl(channel, peerName: peer.name)
-                    channel.send(.invite(name: Identity.displayName))
+                    channel.send(.invite(name: Identity.systemName))
                 case .failure(let error):
                     self.teardown()
                     self.showError("Couldn't reach \(peer.name): \(error.localizedDescription)")
@@ -89,11 +90,14 @@ final class CallController {
             channel.close()
             return
         }
-        // Wait for the invite to learn the caller's name.
+        // Wait for the invite to learn the caller's name. Prefer the name WE
+        // gave this peer when adding them; the name in the invite (the
+        // caller's macOS account name) is only a fallback for unknown hosts.
         channel.onMessage = { [weak self] msg in
             guard let self else { return }
             if case .invite(let name) = msg {
-                self.presentRing(for: channel, callerName: name)
+                let local = PeerStore.shared.peers.first { $0.host == channel.remoteHost }?.name
+                self.presentRing(for: channel, callerName: local ?? name)
             }
         }
         channel.onClosed = { [weak self] in
@@ -110,7 +114,7 @@ final class CallController {
         ring.onAccept = { [weak self] in
             guard let self else { return }
             self.ringWindow = nil
-            channel.send(.accept(name: Identity.displayName))
+            channel.send(.accept(name: Identity.systemName))
             self.beginCall(peerName: callerName, channel: channel)
         }
         ring.onDecline = { [weak self] in
@@ -132,9 +136,11 @@ final class CallController {
         channel.onMessage = { [weak self] msg in
             guard let self else { return }
             switch msg {
-            case .accept(let name):
+            case .accept:
                 if case .dialing = self.state {
-                    self.beginCall(peerName: name.isEmpty ? peerName : name, channel: channel)
+                    // Keep the name the user entered for this peer; the accept
+                    // payload's name is ignored.
+                    self.beginCall(peerName: peerName, channel: channel)
                 }
             case .decline:
                 if case .dialing = self.state {
@@ -183,8 +189,12 @@ final class CallController {
         // Peer video window.
         let window = VideoWindow(peerName: peerName)
         window.onHangUp = { [weak self] in self?.hangUp() }
+        window.onToggleMic = { [weak self] in self?.toggleMic() }
+        window.onToggleCamera = { [weak self] in self?.toggleCamera() }
+        window.onToggleScreenShare = { [weak self] in self?.toggleScreenShare() }
         window.orderFrontRegardless()
         videoWindow = window
+        refreshVideoWindowControls()
 
         cameraUnpacker.reset()
         screenUnpacker.reset()
@@ -226,6 +236,10 @@ final class CallController {
 
     // MARK: - Toggles
 
+    private func refreshVideoWindowControls() {
+        videoWindow?.updateControls(micOn: micOn, cameraOn: cameraOn, sharingScreen: sharingScreen)
+    }
+
     func toggleCamera() {
         cameraOn.toggle()
         if case .inCall = state {
@@ -236,6 +250,7 @@ final class CallController {
             }
             sendLocalState()
         }
+        refreshVideoWindowControls()
         onStateChanged?()
     }
 
@@ -243,6 +258,7 @@ final class CallController {
         micOn.toggle()
         audio.micEnabled = micOn
         if case .inCall = state { sendLocalState() }
+        refreshVideoWindowControls()
         onStateChanged?()
     }
 
@@ -250,6 +266,7 @@ final class CallController {
         if sharingScreen {
             stopScreenShareInternal()
             sendLocalState()
+            refreshVideoWindowControls()
             onStateChanged?()
         } else {
             startScreenShare()
@@ -279,10 +296,20 @@ final class CallController {
         let overlay = AnnotationOverlayWindow(screen: screen)
         overlay.orderFrontRegardless()
         annotationOverlay = overlay
-        screenCapture.excludedWindowIDs = [overlay.windowID]
+
+        let indicator = ScreenShareIndicatorWindow(screen: screen)
+        indicator.orderFrontRegardless()
+        shareIndicator = indicator
+
+        // Local-only chrome stays out of the outgoing stream: annotation
+        // strokes, the sharing indicator, and the floating peer-video window
+        // (otherwise the viewer sees their own face in the shared screen).
+        var excluded: Set<CGWindowID> = [overlay.windowID, indicator.windowID]
+        if let videoWindow { excluded.insert(videoWindow.windowID) }
+        screenCapture.excludedWindowIDs = excluded
 
         let encoder = VideoEncoder(config: .init(width: 2560, height: 1600, fps: 60,
-                                                 bitrate: 8_000_000, keyframeInterval: 4))
+                                                 bitrate: 6_000_000, keyframeInterval: 4))
         encoder.onEncodedFrame = { [weak self] data, key, seq, ts in
             self?.transport.sendFrame(stream: .screen, isKeyframe: key,
                                       sequence: seq, timestampUs: ts, data: data)
@@ -295,6 +322,7 @@ final class CallController {
             guard let self, self.sharingScreen else { return }
             self.stopScreenShareInternal()
             self.sendLocalState()
+            self.refreshVideoWindowControls()
             self.onStateChanged?()
         }
         screenCapture.start { [weak self] ok in
@@ -302,9 +330,12 @@ final class CallController {
             if ok {
                 self.sharingScreen = true
                 self.sendLocalState()
+                self.refreshVideoWindowControls()
             } else {
                 self.annotationOverlay?.close()
                 self.annotationOverlay = nil
+                self.shareIndicator?.close()
+                self.shareIndicator = nil
                 self.screenEncoder?.invalidate()
                 self.screenEncoder = nil
                 self.showError("Screen recording permission is required to share your screen. Grant it in System Settings → Privacy & Security → Screen Recording.")
@@ -319,6 +350,8 @@ final class CallController {
         screenEncoder = nil
         annotationOverlay?.close()
         annotationOverlay = nil
+        shareIndicator?.close()
+        shareIndicator = nil
         sharingScreen = false
     }
 
