@@ -34,12 +34,36 @@ open build/Pairwise.app
 Requires macOS 14+. On first use macOS will prompt for microphone, camera,
 and (when you share) screen-recording permission.
 
+`build.sh` signs with your "Developer ID Application" certificate if one is in
+the keychain (hardened runtime, notarization-ready); otherwise it falls back
+to ad-hoc signing for local development.
+
+## Releasing an update
+
+Updates ship via [Sparkle](https://sparkle-project.org): the app checks
+`appcast.xml` on the `main` branch and downloads the zip from the matching
+GitHub release.
+
+```sh
+./release.sh 1.1
+```
+
+This builds, signs, notarizes, staples, zips, EdDSA-signs the update, adds an
+appcast entry, creates the GitHub release, and pushes. One-time setup:
+
+1. A "Developer ID Application" certificate in the keychain
+   (Xcode → Settings → Accounts → Manage Certificates → + → Developer ID Application).
+2. Notarization credentials:
+   `xcrun notarytool store-credentials pairwise-notary --apple-id <apple-id> --team-id <team-id>`
+   (create an app-specific password at appleid.apple.com).
+3. The Sparkle EdDSA private key in the login keychain
+   (`.build/artifacts/sparkle/Sparkle/bin/generate_keys`, already done on this machine).
+
 ## Using it
 
 1. Both people run Pairwise on the same network (or with UDP/TCP ports 47800
    + 47801 reachable, e.g. via Tailscale or port forwarding).
-2. Click the menu bar icon → your IP is shown at the bottom (click to copy).
-   Tell it to your pair.
+2. Find your IP (for Tailscale: `tailscale ip -4`) and tell it to your pair.
 3. **Add Peer…** → enter their name and IP.
 4. **Call `<name>`** — they accept, and audio + your camera start immediately.
 5. **Share My Screen** from the menu; their viewer window opens automatically.

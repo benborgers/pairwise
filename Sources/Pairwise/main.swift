@@ -1,8 +1,11 @@
 import AppKit
+import Sparkle
 
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var statusItem: NSStatusItem!
     private let callController = CallController()
+    private let updaterController = SPUStandardUpdaterController(
+        startingUpdater: true, updaterDelegate: nil, userDriverDelegate: nil)
 
     private var selfTestPipeline: AudioPipeline?
 
@@ -120,6 +123,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
 
         menu.addItem(.separator())
+        let update = NSMenuItem(title: "Check for Updates…", action: #selector(checkForUpdates), keyEquivalent: "")
+        update.target = self
+        menu.addItem(update)
         let quit = NSMenuItem(title: "Quit Pairwise", action: #selector(quit), keyEquivalent: "q")
         quit.target = self
         menu.addItem(quit)
@@ -172,6 +178,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 PeerStore.shared.add(name: name, host: host)
             }
         }
+    }
+
+    @objc private func checkForUpdates() {
+        NSApp.activate(ignoringOtherApps: true)
+        updaterController.checkForUpdates(nil)
     }
 
     @objc private func toggleMic() { callController.toggleMic() }

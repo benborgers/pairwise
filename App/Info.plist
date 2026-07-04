@@ -26,5 +26,11 @@
 	<string>Pairwise sends your voice to the person you're pairing with.</string>
 	<key>NSHighResolutionCapable</key>
 	<true/>
+	<key>SUFeedURL</key>
+	<string>https://raw.githubusercontent.com/benborgers/pairwise/main/appcast.xml</string>
+	<key>SUPublicEDKey</key>
+	<string>y+yORvt7flNvtsmC2/bRreyxPKsFmBMyArhU/ngQIDg=</string>
+	<key>SUEnableAutomaticChecks</key>
+	<true/>
 </dict>
 </plist>
