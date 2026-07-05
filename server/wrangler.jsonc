@@ -1,0 +1,11 @@
+{
+  "name": "pairwise-rendezvous",
+  "account_id": "67dea42500ed1c73676cafa8aa4f572c",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-07-01",
+  "durable_objects": {
+    "bindings": [{ "name": "ROOMS", "class_name": "Room" }]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Room"] }],
+  "observability": { "enabled": true }
+}

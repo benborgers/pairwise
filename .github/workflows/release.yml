@@ -15,6 +15,9 @@ name: Release
 on:
   push:
     branches: [main]
+    # Server-only changes deploy via deploy-server.yml and shouldn't cut an
+    # app release.
+    paths-ignore: ["server/**"]
 
 concurrency:
   group: release
