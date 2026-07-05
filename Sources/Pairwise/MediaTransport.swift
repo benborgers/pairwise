@@ -59,6 +59,8 @@ final class MediaTransport {
 
     // Pending STUN queries: transaction ID → completion (receive queue).
     private var stunCompletions: [Data: (String, UInt16) -> Void] = [:]
+    // Last keyframe request per stream, for throttling (receive queue).
+    private var lastKfRequestNs: [UInt8: UInt64] = [:]
 
     func start() {
         guard fd < 0 else { return }  // idempotent: rendezvous calls start early
@@ -102,6 +104,7 @@ final class MediaTransport {
             self?.reassembly.removeAll()
             self?.lastDelivered.removeAll()
             self?.stunCompletions.removeAll()
+            self?.lastKfRequestNs.removeAll()
         }
         onPunchPacket = nil
         remoteAddr = nil
@@ -170,6 +173,11 @@ final class MediaTransport {
     }
 
     func requestKeyframe(_ stream: MediaStream) {
+        // Called for every frame dropped while desynced (up to 60/s); the
+        // sender can't usefully produce keyframes anywhere near that fast.
+        let now = DispatchTime.now().uptimeNanoseconds
+        if let last = lastKfRequestNs[stream.rawValue], now &- last < 250_000_000 { return }
+        lastKfRequestNs[stream.rawValue] = now
         kfReqOutCounter.tick("stream \(stream)")
         var d = Data()
         d.appendBE(MediaPacket.magic)

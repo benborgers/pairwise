@@ -18,6 +18,7 @@ final class VideoEncoder {
     private let baseConfig: Config
     private var sequence: UInt32
     private var forceKeyframeFlag = false
+    private var lastForcedKeyframeNs: UInt64 = 0
     private let lock = NSLock()
 
     /// Called with a fully serialized frame ready for the wire.
@@ -52,7 +53,17 @@ final class VideoEncoder {
     }
 
     func forceKeyframe() {
-        lock.lock(); forceKeyframeFlag = true; lock.unlock()
+        // During a loss burst the peer sends one request per dropped frame —
+        // dozens per second. One keyframe every 500 ms is enough to recover;
+        // honoring every request floods the uplink with keyframe bursts and
+        // makes the congestion (and the choppiness) worse.
+        lock.lock()
+        let now = DispatchTime.now().uptimeNanoseconds
+        if now &- lastForcedKeyframeNs >= 500_000_000 {
+            forceKeyframeFlag = true
+            lastForcedKeyframeNs = now
+        }
+        lock.unlock()
     }
 
     func updateBitrate(_ bitrate: Int) {
