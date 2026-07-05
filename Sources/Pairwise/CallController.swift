@@ -552,6 +552,16 @@ final class CallController {
         remoteScreenAspect = screenAspect
 
         if sharingScreen && !remoteSharingScreen {
+            // Only one person shares at a time. A new share takes over: if we
+            // were the one sharing, ours stops (the peer does the same when
+            // we start while they're sharing).
+            if self.sharingScreen {
+                PWLog("share taken over by \(peerName); stopping local share")
+                stopScreenShareInternal()
+                sendLocalState()
+                refreshVideoWindowControls()
+                onStateChanged?()
+            }
             remoteSharingScreen = true
             screenUnpacker.reset()
             lastScreenSeq = nil
