@@ -56,19 +56,32 @@ enum AudioInputDevices {
                                          &addr, 0, nil, &size, &ids) == noErr else { return [] }
 
         return ids.compactMap { id in
-            var streamsAddr = AudioObjectPropertyAddress(
-                mSelector: kAudioDevicePropertyStreams,
-                mScope: kAudioDevicePropertyScopeInput,
-                mElement: kAudioObjectPropertyElementMain)
-            var streamsSize: UInt32 = 0
-            guard AudioObjectGetPropertyDataSize(id, &streamsAddr, 0, nil, &streamsSize) == noErr,
-                  streamsSize > 0 else { return nil }
+            guard inputChannelCount(id) > 0 else { return nil }
             guard let uid = stringProperty(id, kAudioDevicePropertyDeviceUID),
                   let name = stringProperty(id, kAudioObjectPropertyName),
                   // The HAL's internal default-device aggregate is not a real choice.
                   !uid.hasPrefix("CADefaultDeviceAggregate") else { return nil }
             return AudioInputDevice(id: id, uid: uid, name: name)
         }
+    }
+
+    /// Sum of input channels from the stream configuration. Checking for the
+    /// mere presence of an input stream is not enough — some output hardware
+    /// (USB/display audio, speakers) exposes an input stream with zero
+    /// channels and would show up in the microphone list.
+    private static func inputChannelCount(_ id: AudioDeviceID) -> Int {
+        var addr = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyStreamConfiguration,
+            mScope: kAudioDevicePropertyScopeInput,
+            mElement: kAudioObjectPropertyElementMain)
+        var size: UInt32 = 0
+        guard AudioObjectGetPropertyDataSize(id, &addr, 0, nil, &size) == noErr, size > 0 else { return 0 }
+        let buf = UnsafeMutableRawPointer.allocate(byteCount: Int(size),
+                                                   alignment: MemoryLayout<AudioBufferList>.alignment)
+        defer { buf.deallocate() }
+        guard AudioObjectGetPropertyData(id, &addr, 0, nil, &size, buf) == noErr else { return 0 }
+        let abl = UnsafeMutableAudioBufferListPointer(buf.assumingMemoryBound(to: AudioBufferList.self))
+        return abl.reduce(0) { $0 + Int($1.mNumberChannels) }
     }
 
     private static func stringProperty(_ id: AudioObjectID,
