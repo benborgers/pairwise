@@ -17,10 +17,21 @@ final class CallController {
 
     // Signaling
     private let listener = ControlListener()
-    private var control: ControlChannel?
+    private var control: SignalingChannel?
+    /// One persistent room connection per code peer (presence + relay).
+    private var rendezvous: [String: RendezvousClient] = [:]
 
     // Media
     private let transport = MediaTransport()
+    private var puncher: HolePuncher?
+    /// Candidates from a relay invite, held until the user accepts.
+    private var pendingRemoteCandidates: [MediaCandidate]?
+
+    /// Where the media stream should go once a call is established.
+    private enum MediaDestination {
+        case direct(host: String)
+        case punch(remoteCandidates: [MediaCandidate])
+    }
     private let audio = AudioPipeline()
     private let camera = CameraCapture()
     private var cameraEncoder: VideoEncoder?
@@ -60,14 +71,99 @@ final class CallController {
         listener.onIncoming = { [weak self] channel in self?.handleIncoming(channel) }
         listener.start()
         wireTransport()
+        syncRendezvousRooms()
+        PeerStore.shared.onChanged = { [weak self] in self?.syncRendezvousRooms() }
+    }
+
+    // MARK: - Rendezvous rooms
+
+    /// Keep one live room connection per code peer so incoming calls ring
+    /// and the menu shows presence; drop rooms whose peer was removed.
+    private func syncRendezvousRooms() {
+        let codes = Set(PeerStore.shared.peers.compactMap(\.code))
+        for (code, client) in rendezvous where !codes.contains(code) {
+            client.shutdown()
+            rendezvous[code] = nil
+        }
+        for code in codes where rendezvous[code] == nil {
+            let client = RendezvousClient(code: code)
+            client.onPresenceChanged = { [weak client] in
+                guard let client else { return }
+                PresenceStore.shared.setOnline(key: client.code, online: client.peerPresent)
+            }
+            client.onIncomingSignal = { [weak self, weak client] msg in
+                guard let self, let client else { return }
+                self.handleRelaySignal(client: client, message: msg)
+            }
+            rendezvous[code] = client
+            client.connect()
+        }
+    }
+
+    private func handleRelaySignal(client: RendezvousClient, message: ControlMessage) {
+        guard case .invite(let name, let candidates) = message else { return }
+        guard case .idle = state else {
+            client.sendSignal(.decline)
+            return
+        }
+        let channel = client.makeChannel()
+        control = channel
+        pendingRemoteCandidates = candidates
+        // Until the call starts, watch for the caller giving up. (TCP calls
+        // get this for free from the connection dropping; the relay channel
+        // outlives a cancelled ring.)
+        channel.onMessage = { [weak self] msg in
+            guard let self, case .ringing = self.state, case .hangup = msg else { return }
+            self.abortRing(channel)
+        }
+        channel.onClosed = { [weak self] in
+            guard let self, case .ringing = self.state else { return }
+            self.abortRing(channel)
+        }
+        let local = PeerStore.shared.peers.first { $0.code == client.code }?.name
+        presentRing(for: channel, callerName: local ?? name)
+    }
+
+    private func abortRing(_ channel: SignalingChannel) {
+        ringWindow?.stopRinging()
+        ringWindow = nil
+        channel.close()
+        control = nil
+        pendingRemoteCandidates = nil
+        state = .idle
     }
 
     // MARK: - Outgoing call
 
     func call(peer: Peer) {
         guard case .idle = state else { return }
-        state = .dialing(peerName: peer.name)
 
+        if let code = peer.code {
+            guard let client = rendezvous[code] else { return }
+            guard client.peerPresent else {
+                showError("\(peer.name) isn't online right now (their Pairwise isn't connected).")
+                return
+            }
+            state = .dialing(peerName: peer.name)
+            let outgoing = OutgoingCallWindow(calleeName: peer.name)
+            outgoing.onCancel = { [weak self] in self?.hangUp() }
+            outgoing.orderFrontRegardless()
+            outgoingWindow = outgoing
+
+            // Bind the media socket now: candidates (STUN mapping included)
+            // are only meaningful for the socket that will carry media.
+            transport.start()
+            HolePuncher.gatherCandidates(transport: transport) { [weak self] candidates in
+                guard let self, case .dialing = self.state else { return }
+                let channel = client.makeChannel()
+                self.control = channel
+                self.wireControl(channel, peerName: peer.name)
+                channel.send(.invite(name: Identity.systemName, candidates: candidates))
+            }
+            return
+        }
+
+        state = .dialing(peerName: peer.name)
         let outgoing = OutgoingCallWindow(calleeName: peer.name)
         outgoing.onCancel = { [weak self] in self?.hangUp() }
         outgoing.orderFrontRegardless()
@@ -103,7 +199,7 @@ final class CallController {
         // caller's macOS account name) is only a fallback for unknown hosts.
         channel.onMessage = { [weak self] msg in
             guard let self else { return }
-            if case .invite(let name) = msg {
+            if case .invite(let name, _) = msg {
                 let local = PeerStore.shared.peers.first { $0.host == channel.remoteHost }?.name
                 self.presentRing(for: channel, callerName: local ?? name)
             }
@@ -116,14 +212,27 @@ final class CallController {
         control = channel
     }
 
-    private func presentRing(for channel: ControlChannel, callerName: String) {
+    private func presentRing(for channel: SignalingChannel, callerName: String) {
         state = .ringing(callerName: callerName)
         let ring = RingWindow(callerName: callerName)
         ring.onAccept = { [weak self] in
             guard let self else { return }
             self.ringWindow = nil
-            channel.send(.accept(name: Identity.systemName))
-            self.beginCall(peerName: callerName, channel: channel)
+            if channel.isRelay {
+                // Gather our candidates before accepting so the accept can
+                // carry them; then both sides punch simultaneously.
+                self.transport.start()
+                HolePuncher.gatherCandidates(transport: self.transport) { [weak self] candidates in
+                    guard let self, case .ringing = self.state else { return }
+                    channel.send(.accept(name: Identity.systemName, candidates: candidates))
+                    self.beginCall(peerName: callerName, channel: channel,
+                                   media: .punch(remoteCandidates: self.pendingRemoteCandidates ?? []))
+                }
+            } else {
+                channel.send(.accept(name: Identity.systemName))
+                self.beginCall(peerName: callerName, channel: channel,
+                               media: .direct(host: channel.remoteHost))
+            }
         }
         ring.onDecline = { [weak self] in
             guard let self else { return }
@@ -131,6 +240,7 @@ final class CallController {
             channel.send(.decline)
             channel.close()
             self.control = nil
+            self.pendingRemoteCandidates = nil
             self.state = .idle
         }
         ring.startRinging()
@@ -140,15 +250,18 @@ final class CallController {
 
     // MARK: - Established call
 
-    private func wireControl(_ channel: ControlChannel, peerName: String) {
+    private func wireControl(_ channel: SignalingChannel, peerName: String) {
         channel.onMessage = { [weak self] msg in
             guard let self else { return }
             switch msg {
-            case .accept:
+            case .accept(_, let candidates):
                 if case .dialing = self.state {
                     // Keep the name the user entered for this peer; the accept
                     // payload's name is ignored.
-                    self.beginCall(peerName: peerName, channel: channel)
+                    let media: MediaDestination = channel.isRelay
+                        ? .punch(remoteCandidates: candidates ?? [])
+                        : .direct(host: channel.remoteHost)
+                    self.beginCall(peerName: peerName, channel: channel, media: media)
                 }
             case .decline:
                 if case .dialing = self.state {
@@ -173,15 +286,33 @@ final class CallController {
         }
     }
 
-    private func beginCall(peerName: String, channel: ControlChannel) {
+    private func beginCall(peerName: String, channel: SignalingChannel, media: MediaDestination) {
         outgoingWindow?.orderOut(nil)
         outgoingWindow = nil
         state = .inCall(peerName: peerName)
-        PWLog("call started with \(peerName) at \(channel.remoteHost)")
         wireControl(channel, peerName: peerName)
 
         transport.start()
-        transport.setRemote(host: channel.remoteHost)
+        switch media {
+        case .direct(let host):
+            PWLog("call started with \(peerName) at \(host)")
+            transport.setRemote(host: host)
+        case .punch(let remoteCandidates):
+            PWLog("call started with \(peerName) via rendezvous; punching")
+            // Media pipelines start now; frames sent before the punch
+            // completes are dropped (no remote yet) and recover via the
+            // keyframe-request path within a second of the path opening.
+            let p = HolePuncher(transport: transport, candidates: remoteCandidates)
+            p.onEstablished = { [weak self] _, _ in self?.puncher = nil }
+            p.onFailed = { [weak self] in
+                guard let self, case .inCall = self.state else { return }
+                self.hangUp()
+                self.showError("Couldn't establish a direct connection to \(peerName). Both NATs may be blocking UDP hole punching.")
+            }
+            p.start()
+            puncher = p
+        }
+        pendingRemoteCandidates = nil
 
         // Audio both ways.
         audio.micEnabled = micOn
@@ -224,6 +355,9 @@ final class CallController {
         if case .inCall = state { PWLog("call ended") }
         control?.close()
         control = nil
+        puncher?.stop()
+        puncher = nil
+        pendingRemoteCandidates = nil
 
         audio.stop()
         camera.stop()

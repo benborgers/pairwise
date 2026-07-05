@@ -1,5 +1,6 @@
 import Foundation
 import Darwin
+import Security
 
 /// A complete, reassembled media frame.
 struct MediaFrame {
@@ -22,6 +23,9 @@ final class MediaTransport {
     var onFrame: ((MediaFrame) -> Void)?
     /// Fired (on an internal queue) when the peer asks for a fresh keyframe.
     var onKeyframeRequest: ((MediaStream) -> Void)?
+    /// Fired (on an internal queue) for hole-punch probes/acks, with the
+    /// sender's observed source address. Set only while a punch is running.
+    var onPunchPacket: ((_ isAck: Bool, _ ip: String, _ port: UInt16) -> Void)?
 
     private var reassembly: [UInt8: [UInt32: PartialFrame]] = [:]
     private var lastDelivered: [UInt8: UInt32] = [:]
@@ -48,10 +52,16 @@ final class MediaTransport {
         var createdAt: UInt64  // mach time ns
     }
 
-    // Special stream byte for in-band keyframe requests.
+    // Special stream bytes for in-band non-media packets.
     private static let keyframeRequestStream: UInt8 = 200
+    private static let punchProbeStream: UInt8 = 201
+    private static let punchAckStream: UInt8 = 202
+
+    // Pending STUN queries: transaction ID → completion (receive queue).
+    private var stunCompletions: [Data: (String, UInt16) -> Void] = [:]
 
     func start() {
+        guard fd < 0 else { return }  // idempotent: rendezvous calls start early
         fd = socket(AF_INET, SOCK_DGRAM, 0)
         guard fd >= 0 else { PWLog("UDP socket failed"); return }
 
@@ -91,35 +101,46 @@ final class MediaTransport {
         queue.async { [weak self] in
             self?.reassembly.removeAll()
             self?.lastDelivered.removeAll()
+            self?.stunCompletions.removeAll()
         }
+        onPunchPacket = nil
         remoteAddr = nil
     }
 
-    /// Point outgoing media at the peer.
-    func setRemote(host: String) {
+    /// Resolve a hostname or dotted-quad to an IPv4 address (blocking).
+    private static func resolveIPv4(_ host: String) -> in_addr? {
+        var resolved = in_addr()
+        if inet_pton(AF_INET, host, &resolved) == 1 { return resolved }
+        var hints = addrinfo(ai_flags: 0, ai_family: AF_INET, ai_socktype: SOCK_DGRAM,
+                             ai_protocol: 0, ai_addrlen: 0, ai_canonname: nil, ai_addr: nil, ai_next: nil)
+        var result: UnsafeMutablePointer<addrinfo>?
+        guard getaddrinfo(host, nil, &hints, &result) == 0, let res = result else { return nil }
+        defer { freeaddrinfo(result) }
+        var out = in_addr()
+        res.pointee.ai_addr.withMemoryRebound(to: sockaddr_in.self, capacity: 1) { sin in
+            out = sin.pointee.sin_addr
+        }
+        return out
+    }
+
+    private static func makeAddr(_ ip: in_addr, port: UInt16) -> sockaddr_in {
         var addr = sockaddr_in()
         addr.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
         addr.sin_family = sa_family_t(AF_INET)
-        addr.sin_port = Ports.media.bigEndian
-        var resolved = in_addr()
-        if inet_pton(AF_INET, host, &resolved) == 1 {
-            addr.sin_addr = resolved
-        } else {
-            // Resolve hostname
-            var hints = addrinfo(ai_flags: 0, ai_family: AF_INET, ai_socktype: SOCK_DGRAM,
-                                 ai_protocol: 0, ai_addrlen: 0, ai_canonname: nil, ai_addr: nil, ai_next: nil)
-            var result: UnsafeMutablePointer<addrinfo>?
-            if getaddrinfo(host, nil, &hints, &result) == 0, let res = result {
-                defer { freeaddrinfo(result) }
-                res.pointee.ai_addr.withMemoryRebound(to: sockaddr_in.self, capacity: 1) { sin in
-                    addr.sin_addr = sin.pointee.sin_addr
-                }
-            } else {
-                PWLog("could not resolve media host \(host)")
-                return
-            }
+        addr.sin_port = port.bigEndian
+        addr.sin_addr = ip
+        return addr
+    }
+
+    /// Point outgoing media at the peer. Direct-IP calls use the default
+    /// media port; hole-punched paths pass the NAT-observed port.
+    func setRemote(host: String, port: UInt16 = Ports.media) {
+        guard let ip = Self.resolveIPv4(host) else {
+            PWLog("could not resolve media host \(host)")
+            return
         }
-        PWLog("media remote set to \(host)")
+        PWLog("media remote set to \(host):\(port)")
+        let addr = Self.makeAddr(ip, port: port)
         sendQueue.async { [weak self] in self?.remoteAddr = addr }
     }
 
@@ -169,20 +190,137 @@ final class MediaTransport {
         }
     }
 
+    // MARK: - Hole punching
+
+    /// Fire a raw datagram at an arbitrary endpoint (punch probes/acks).
+    private func sendRaw(_ d: Data, to addr: sockaddr_in) {
+        sendQueue.async { [weak self] in
+            guard let self, self.fd >= 0 else { return }
+            var a = addr
+            d.withUnsafeBytes { raw in
+                _ = withUnsafePointer(to: &a) { ptr in
+                    ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
+                        sendto(self.fd, raw.baseAddress, raw.count, 0, sa,
+                               socklen_t(MemoryLayout<sockaddr_in>.size))
+                    }
+                }
+            }
+        }
+    }
+
+    func sendPunch(ack: Bool, toIP ip: String, port: UInt16) {
+        guard let resolved = Self.resolveIPv4(ip) else { return }
+        var d = Data()
+        d.appendBE(MediaPacket.magic)
+        d.append(ack ? MediaTransport.punchAckStream : MediaTransport.punchProbeStream)
+        d.append(Data(count: MediaPacket.headerSize - d.count))
+        sendRaw(d, to: Self.makeAddr(resolved, port: port))
+    }
+
+    // MARK: - STUN (RFC 5389 binding request, IPv4)
+
+    /// Ask public STUN servers what this socket's UDP endpoint looks like
+    /// from the internet. Must run on the already-bound media socket so the
+    /// discovered mapping is the one the peer's packets will hit.
+    func discoverPublicAddress(completion: @escaping ((ip: String, port: UInt16)?) -> Void) {
+        let servers: [(String, UInt16)] = [
+            ("stun.cloudflare.com", 3478),
+            ("stun.l.google.com", 19302),
+        ]
+        var txID = Data(count: 12)
+        txID.withUnsafeMutableBytes { _ = SecRandomCopyBytes(kSecRandomDefault, 12, $0.baseAddress!) }
+
+        var request = Data()
+        request.appendBE(UInt16(0x0001))       // binding request
+        request.appendBE(UInt16(0))            // no attributes
+        request.appendBE(UInt32(0x2112A442))   // magic cookie
+        request.append(txID)
+
+        var done = false
+        queue.async { [weak self] in
+            guard let self else { return }
+            self.stunCompletions[txID] = { ip, port in
+                guard !done else { return }
+                done = true
+                PWLog("STUN: public endpoint \(ip):\(port)")
+                DispatchQueue.main.async { completion((ip, port)) }
+            }
+        }
+        for (host, port) in servers {
+            sendQueue.async { [weak self] in
+                guard let self, self.fd >= 0, let ip = Self.resolveIPv4(host) else { return }
+                var addr = Self.makeAddr(ip, port: port)
+                request.withUnsafeBytes { raw in
+                    _ = withUnsafePointer(to: &addr) { ptr in
+                        ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
+                            sendto(self.fd, raw.baseAddress, raw.count, 0, sa,
+                                   socklen_t(MemoryLayout<sockaddr_in>.size))
+                        }
+                    }
+                }
+            }
+        }
+        queue.asyncAfter(deadline: .now() + 2) { [weak self] in
+            self?.stunCompletions[txID] = nil
+            guard !done else { return }
+            done = true
+            PWLog("STUN: no response from any server")
+            DispatchQueue.main.async { completion(nil) }
+        }
+    }
+
+    /// Parse a STUN binding success response; returns true if the datagram
+    /// was STUN (and thus not a media packet).
+    private func handlePossibleStun(_ d: Data) -> Bool {
+        guard d.count >= 20, d[d.startIndex] & 0xC0 == 0,
+              d.readBE(UInt32.self, at: 4) == 0x2112A442 else { return false }
+        let txID = d.subdata(in: (d.startIndex + 8)..<(d.startIndex + 20))
+        guard let completion = stunCompletions[txID] else { return true }
+        guard d.readBE(UInt16.self, at: 0) == 0x0101 else { return true }  // binding success
+
+        var offset = 20
+        while offset + 4 <= d.count {
+            let attrType = d.readBE(UInt16.self, at: offset)
+            let attrLen = Int(d.readBE(UInt16.self, at: offset + 2))
+            let valueStart = offset + 4
+            guard valueStart + attrLen <= d.count else { break }
+            if attrType == 0x0020, attrLen >= 8, d[d.startIndex + valueStart + 1] == 0x01 {
+                // XOR-MAPPED-ADDRESS, IPv4: un-XOR with the magic cookie.
+                let port = d.readBE(UInt16.self, at: valueStart + 2) ^ 0x2112
+                let raw = d.readBE(UInt32.self, at: valueStart + 4) ^ 0x2112A442
+                let ip = "\(raw >> 24).\((raw >> 16) & 0xFF).\((raw >> 8) & 0xFF).\(raw & 0xFF)"
+                stunCompletions[txID] = nil
+                completion(ip, port)
+                return true
+            }
+            offset = valueStart + (attrLen + 3) & ~3  // attributes pad to 4
+        }
+        return true
+    }
+
     // MARK: - Receive path
 
     private func drainSocket() {
         var buffer = [UInt8](repeating: 0, count: 65536)
+        var src = sockaddr_in()
         while true {
-            let n = recv(fd, &buffer, buffer.count, 0)
+            var slen = socklen_t(MemoryLayout<sockaddr_in>.size)
+            let n = withUnsafeMutablePointer(to: &src) { ptr in
+                ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
+                    recvfrom(fd, &buffer, buffer.count, 0, sa, &slen)
+                }
+            }
             guard n > 0 else { break }
-            handleDatagram(Data(bytes: buffer, count: n))
+            handleDatagram(Data(bytes: buffer, count: n), from: src)
         }
     }
 
-    private func handleDatagram(_ d: Data) {
+    private func handleDatagram(_ d: Data, from src: sockaddr_in) {
         guard d.count >= MediaPacket.headerSize else { return }
-        guard d.readBE(UInt16.self, at: 0) == MediaPacket.magic else { return }
+        guard d.readBE(UInt16.self, at: 0) == MediaPacket.magic else {
+            _ = handlePossibleStun(d)
+            return
+        }
 
         let streamByte = d[d.startIndex + 2]
         if streamByte == MediaTransport.keyframeRequestStream {
@@ -190,6 +328,14 @@ final class MediaTransport {
                 kfReqInCounter.tick("stream \(s)")
                 onKeyframeRequest?(s)
             }
+            return
+        }
+        if streamByte == MediaTransport.punchProbeStream || streamByte == MediaTransport.punchAckStream {
+            var ipBuf = [CChar](repeating: 0, count: Int(INET_ADDRSTRLEN))
+            var addr = src.sin_addr
+            inet_ntop(AF_INET, &addr, &ipBuf, socklen_t(INET_ADDRSTRLEN))
+            onPunchPacket?(streamByte == MediaTransport.punchAckStream,
+                           String(cString: ipBuf), UInt16(bigEndian: src.sin_port))
             return
         }
 

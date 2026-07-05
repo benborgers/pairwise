@@ -4,11 +4,12 @@ import Sparkle
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var statusItem: NSStatusItem!
     private let callController = CallController()
-    private var presenceItems: [String: NSMenuItem] = [:]  // peer host → menu line
+    private var presenceItems: [String: NSMenuItem] = [:]  // peer presenceKey → menu line
     private let updaterController = SPUStandardUpdaterController(
         startingUpdater: true, updaterDelegate: nil, userDriverDelegate: nil)
 
     private var selfTestPipeline: AudioPipeline?
+    private var selfTestTransport: MediaTransport?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         PWLog("app ready — build \(Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "?")")
@@ -31,6 +32,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             }
             return
         }
+        // Headless hole-punch smoke test: prints this machine's media
+        // candidates (LAN + STUN public mapping) and exits.
+        if ProcessInfo.processInfo.environment["PAIRWISE_STUN_SELFTEST"] == "1" {
+            let transport = MediaTransport()
+            selfTestTransport = transport
+            transport.start()
+            HolePuncher.gatherCandidates(transport: transport) { candidates in
+                print("STUN_SELFTEST: \(candidates.map { "\($0.ip):\($0.port)" }.joined(separator: ", "))")
+                exit(candidates.isEmpty ? 1 : 0)
+            }
+            return
+        }
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
         if let button = statusItem.button {
             button.image = MenuBarIcon.pear
@@ -47,8 +60,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // repaint the dots in place.
         PresenceStore.shared.onChanged = { [weak self] in
             guard let self else { return }
-            for (host, item) in self.presenceItems {
-                item.image = Self.presenceDot(online: PresenceStore.shared.online[host])
+            for (key, item) in self.presenceItems {
+                item.image = Self.presenceDot(online: PresenceStore.shared.online[key])
             }
         }
 
@@ -127,10 +140,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 for peer in peers {
                     let item = NSMenuItem(title: "Call \(peer.name)", action: #selector(callPeer(_:)), keyEquivalent: "")
                     item.target = self
-                    item.image = Self.presenceDot(online: PresenceStore.shared.online[peer.host])
+                    item.image = Self.presenceDot(online: PresenceStore.shared.online[peer.presenceKey])
                     item.representedObject = peer.id
                     menu.addItem(item)
-                    presenceItems[peer.host] = item
+                    presenceItems[peer.presenceKey] = item
 
                     // Holding ⌥ flips the call line into a remove action.
                     let remove = NSMenuItem(title: "Remove \(peer.name)", action: #selector(removePeer(_:)), keyEquivalent: "")
@@ -141,7 +154,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                     remove.image = NSImage(systemSymbolName: "trash", accessibilityDescription: nil)
                     menu.addItem(remove)
                 }
-                PresenceStore.shared.refresh(hosts: peers.map(\.host))
+                // Code peers get presence pushed from their rendezvous room.
+                PresenceStore.shared.refresh(hosts: peers.filter { $0.code == nil }.map(\.host))
                 menu.addItem(.separator())
             }
             menu.addItem(makeItem(title: "Add Peer…", symbol: "plus", action: #selector(addPeer)))
@@ -269,7 +283,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         NSApp.activate(ignoringOtherApps: true)
         let alert = NSAlert()
         alert.messageText = "Add Peer"
-        alert.informativeText = "Enter a name and the peer's IP address (they need Pairwise running)."
+        alert.informativeText = "Enter a name, plus either the peer's IP address or a shared code you both add (any word you agree on, e.g. ben-jerome)."
         alert.addButton(withTitle: "Add")
         alert.addButton(withTitle: "Cancel")
 
@@ -279,7 +293,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let nameField = NSTextField(frame: NSRect(x: 0, y: 0, width: 240, height: 24))
         nameField.placeholderString = "Name"
         let hostField = NSTextField(frame: NSRect(x: 0, y: 0, width: 240, height: 24))
-        hostField.placeholderString = "IP address (e.g. 192.168.1.42)"
+        hostField.placeholderString = "IP address or shared code"
         stack.addArrangedSubview(nameField)
         stack.addArrangedSubview(hostField)
         alert.accessoryView = stack
@@ -287,9 +301,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         if alert.runModal() == .alertFirstButtonReturn {
             let name = nameField.stringValue.trimmingCharacters(in: .whitespaces)
-            let host = hostField.stringValue.trimmingCharacters(in: .whitespaces)
-            if !name.isEmpty, !host.isEmpty {
-                PeerStore.shared.add(name: name, host: host)
+            let target = hostField.stringValue.trimmingCharacters(in: .whitespaces)
+            if !name.isEmpty, !target.isEmpty {
+                // Dots/colons mean an address (IPv4, IPv6, hostname); anything
+                // else is treated as a rendezvous room code.
+                if target.contains(".") || target.contains(":") {
+                    PeerStore.shared.add(name: name, host: target)
+                } else {
+                    PeerStore.shared.add(name: name, host: "", code: target.lowercased())
+                }
             }
         }
     }

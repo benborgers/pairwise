@@ -14,6 +14,16 @@ final class PresenceStore {
 
     private var inFlight: Set<String> = []
 
+    /// Presence pushed from elsewhere (rendezvous room occupancy for
+    /// code peers). Main thread.
+    func setOnline(key: String, online reachable: Bool) {
+        guard online[key] != reachable else { return }
+        online[key] = reachable
+        onChanged?()
+    }
+
+    /// TCP-probe direct-IP peers only; code peers get presence pushed via
+    /// setOnline from their rendezvous room.
     func refresh(hosts: [String]) {
         for host in hosts where !inFlight.contains(host) {
             inFlight.insert(host)

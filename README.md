@@ -1,8 +1,9 @@
 # Pairwise
 
 A fast, fully peer-to-peer pair-programming app for macOS — a Tuple clone with
-no servers, no accounts, and no cloud. You add a peer by IP address and media
-flows directly between the two machines.
+no accounts and no cloud. Add a peer by IP address, or by a shared code that
+rendezvouses through a tiny Cloudflare Worker; either way media flows directly
+between the two machines.
 
 ## Features
 
@@ -10,6 +11,13 @@ flows directly between the two machines.
 - **Direct P2P calls** — add a peer's IP, hit Call; they get a ring panel with
   Accept / Decline. Signaling runs over TCP (port 47800), media over UDP
   (port 47801). Nothing ever touches a third-party server.
+- **Shared-code calls (no Tailscale/VPN needed)** — both people add the same
+  code word instead of an IP. A Cloudflare Worker + Durable Object
+  (`server/`) acts as a rendezvous room: it carries presence and the tiny
+  JSON call-signaling messages, while audio/video are hole-punched directly
+  peer-to-peer over UDP (STUN via Cloudflare/Google for the public endpoint;
+  no media relay, so it fails rather than falls back if both NATs block
+  punching — LAN and Tailscale paths are tried too).
 - **Floating video window** — a small always-on-top square showing the peer's
   camera. Hover over the video and it turns translucent and click-through, so
   it never blocks your work; drag it by its top bar. Toggle camera and mic
@@ -50,21 +58,53 @@ Releases are automatic: every push to `main` runs the GitHub Actions
 build, sign, notarize, staple, zip, EdDSA-sign the update, add an appcast
 entry, create the GitHub release, and push. Don't run `release.sh` locally.
 
+Release notes (on both the GitHub release and Sparkle's update dialog) are
+the commit subjects since the previous release tag — usually the single
+commit that triggered the release.
+
 The workflow needs these repository secrets (documented at the top of
 `release.yml`): `DEVELOPER_ID_CERT_P12`, `DEVELOPER_ID_CERT_PASSWORD`,
 `APPLE_ID`, `APPLE_TEAM_ID`, `APPLE_APP_PASSWORD`, `SPARKLE_PRIVATE_KEY`.
 
 ## Using it
 
+**With a shared code (easiest):**
+
+1. Agree on a code word with your pair (e.g. `ben-jerome`).
+2. Both: **Add Peer…** → enter the other person's name and the code word.
+3. The presence dot turns green when they're online; **Call `<name>`** rings
+   them, and media connects directly via UDP hole punching.
+
+**With an IP address:**
+
 1. Both people run Pairwise on the same network (or with UDP/TCP ports 47800
    + 47801 reachable, e.g. via Tailscale or port forwarding).
 2. Find your IP (for Tailscale: `tailscale ip -4`) and tell it to your pair.
 3. **Add Peer…** → enter their name and IP.
-4. **Call `<name>`** — they accept, and audio + your camera start immediately.
-5. **Share My Screen** from the menu; their viewer window opens automatically.
-   They can draw on it any time; you'll see the strokes on your screen.
 
-Currently IPv4 only. Works great over Tailscale for pairing across networks.
+Then: **Call `<name>`** — they accept, and audio + your camera start
+immediately. **Share My Screen** from the menu; their viewer window opens
+automatically and they can draw on it any time. Only one person shares at a
+time — starting a share while your pair is sharing takes it over.
+
+Currently IPv4 only.
+
+## Rendezvous server (`server/`)
+
+A Cloudflare Worker with one Durable Object per room code, using the
+WebSocket Hibernation API (idle rooms cost nothing). It only ever sees
+presence events and small JSON signaling messages — never media. Deployed at
+`https://pairwise-rendezvous.benborgers.workers.dev`; the app can be pointed
+elsewhere via
+`defaults write dev.benborgers.pairwise pairwise.rendezvousURL wss://…`.
+
+Pushes to `main` that touch `server/` deploy it automatically
+(`.github/workflows/deploy-server.yml`, needs the `CLOUDFLARE_API_TOKEN`
+repository secret); those pushes don't cut an app release. Manual deploy:
+
+```sh
+cd server && npx wrangler deploy
+```
 
 ## Architecture
 

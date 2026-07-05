@@ -10,8 +10,10 @@ enum Ports {
 // MARK: - Control channel messages (length-prefixed JSON over TCP)
 
 enum ControlMessage: Codable {
-    case invite(name: String)
-    case accept(name: String)
+    /// `candidates` are the sender's UDP endpoints for hole punching; present
+    /// only on rendezvous (room-code) calls, absent on direct-IP calls.
+    case invite(name: String, candidates: [MediaCandidate]? = nil)
+    case accept(name: String, candidates: [MediaCandidate]? = nil)
     case decline
     case hangup
     case state(cameraOn: Bool, micOn: Bool, sharingScreen: Bool, screenAspect: Double)
@@ -20,7 +22,7 @@ enum ControlMessage: Codable {
     case pong
 
     private enum CodingKeys: String, CodingKey {
-        case type, name, cameraOn, micOn, sharingScreen, screenAspect, points, colorIndex, strokeID
+        case type, name, cameraOn, micOn, sharingScreen, screenAspect, points, colorIndex, strokeID, candidates
     }
 
     init(from decoder: Decoder) throws {
@@ -28,9 +30,11 @@ enum ControlMessage: Codable {
         let type = try c.decode(String.self, forKey: .type)
         switch type {
         case "invite":
-            self = .invite(name: try c.decode(String.self, forKey: .name))
+            self = .invite(name: try c.decode(String.self, forKey: .name),
+                           candidates: try c.decodeIfPresent([MediaCandidate].self, forKey: .candidates))
         case "accept":
-            self = .accept(name: try c.decode(String.self, forKey: .name))
+            self = .accept(name: try c.decode(String.self, forKey: .name),
+                           candidates: try c.decodeIfPresent([MediaCandidate].self, forKey: .candidates))
         case "decline":
             self = .decline
         case "hangup":
@@ -58,12 +62,14 @@ enum ControlMessage: Codable {
     func encode(to encoder: Encoder) throws {
         var c = encoder.container(keyedBy: CodingKeys.self)
         switch self {
-        case .invite(let name):
+        case .invite(let name, let candidates):
             try c.encode("invite", forKey: .type)
             try c.encode(name, forKey: .name)
-        case .accept(let name):
+            try c.encodeIfPresent(candidates, forKey: .candidates)
+        case .accept(let name, let candidates):
             try c.encode("accept", forKey: .type)
             try c.encode(name, forKey: .name)
+            try c.encodeIfPresent(candidates, forKey: .candidates)
         case .decline:
             try c.encode("decline", forKey: .type)
         case .hangup:
@@ -90,6 +96,14 @@ enum ControlMessage: Codable {
 struct AnnotationPoint: Codable {
     var x: Double
     var y: Double
+}
+
+/// A UDP endpoint a peer can (maybe) be reached at: LAN addresses plus the
+/// STUN-discovered public mapping. Exchanged during rendezvous calls; both
+/// sides probe every candidate and keep the first path that answers.
+struct MediaCandidate: Codable {
+    var ip: String
+    var port: UInt16
 }
 
 // MARK: - Media packet format (UDP)
