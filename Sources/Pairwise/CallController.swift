@@ -452,8 +452,12 @@ final class CallController {
     }
 
     private func startCamera() {
-        let encoder = VideoEncoder(config: .init(width: 1280, height: 720, fps: 30,
-                                                 bitrate: 1_200_000, keyframeInterval: 2),
+        // 480p: the feed only shows in the small floating window (which
+        // aspect-fills, so 4:3 480p crops less than 16:9 did). The encoder
+        // session adopts the capture's actual dimensions; these are the
+        // bitrate plan.
+        let encoder = VideoEncoder(config: .init(width: 854, height: 480, fps: 30,
+                                                 bitrate: 800_000, keyframeInterval: 2),
                                    firstSequence: cameraSeqNext)
         encoder.onEncodedFrame = { [weak self] data, key, seq, ts in
             self?.transport.sendFrame(stream: .camera, isKeyframe: key,

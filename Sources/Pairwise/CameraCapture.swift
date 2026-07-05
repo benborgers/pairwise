@@ -111,21 +111,23 @@ final class CameraCapture: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
         session.commitConfiguration()
     }
 
-    /// Pin the device to a ~720p30 format. Session presets proved unreliable
-    /// here (both test machines delivered 1080p under .hd1280x720, starving
-    /// the encoder's bitrate budget), so pick the activeFormat explicitly.
-    /// Also cap auto-exposure at 1/24 s: in low light it otherwise stretches
-    /// frame duration and the feed visibly stutters.
+    /// Pin the device to a ~480p30 format — the feed only ever shows in the
+    /// small floating window, so 720p+ just burns bandwidth. Session presets
+    /// proved unreliable here (both test machines delivered 1080p under
+    /// .hd1280x720, starving the encoder's bitrate budget), so pick the
+    /// activeFormat explicitly. Also cap auto-exposure at 1/24 s: in low
+    /// light it otherwise stretches frame duration and the feed visibly
+    /// stutters.
     private func configureFormat(_ device: AVCaptureDevice) {
-        let targetPixels = 1280 * 720
+        let targetPixels = 854 * 480
         var best: AVCaptureDevice.Format?
         var bestScore = Int.max
         for format in device.formats {
             let dims = CMVideoFormatDescriptionGetDimensions(format.formatDescription)
             guard format.videoSupportedFrameRateRanges.contains(where: { $0.maxFrameRate >= 24 }) else { continue }
             let pixels = Int(dims.width) * Int(dims.height)
-            // Prefer the closest pixel count to 720p, undersized only if
-            // nothing at or above the target exists.
+            // Prefer the closest pixel count to the target, undersized only
+            // if nothing at or above it exists.
             let score = pixels >= targetPixels ? pixels - targetPixels
                                                : (targetPixels - pixels) * 4
             if score < bestScore {
