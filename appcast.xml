@@ -6,6 +6,15 @@
     <language>en</language>
     <!-- releases -->
     <item>
+      <title>1.8</title>
+      <pubDate>Sun, 05 Jul 2026 01:39:58 +0000</pubDate>
+      <sparkle:version>1.8</sparkle:version>
+      <sparkle:shortVersionString>1.8</sparkle:shortVersionString>
+      <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
+      <description><![CDATA[<ul><li>Smooth out video during packet loss by throttling keyframe requests</li><li>Keep output-only devices out of the microphone menu</li><li>Fix crash when starting the camera on a Studio Display</li></ul>]]></description>
+      <enclosure url="https://github.com/benborgers/pairwise/releases/download/v1.8/Pairwise-1.8.dmg" sparkle:edSignature="deCuWDVtP4g0Mu/yvWXM/kMzjJfw39U/vBS8Z8qL6vxjzsWoKQisURkOsT0X1elJ6UIxVEKsYO8M4H660i7UCA==" length="1655259" type="application/octet-stream"/>
+    </item>
+    <item>
       <title>1.7</title>
       <pubDate>Sun, 05 Jul 2026 00:34:43 +0000</pubDate>
       <sparkle:version>1.7</sparkle:version>
