@@ -6,6 +6,15 @@
     <language>en</language>
     <!-- releases -->
     <item>
+      <title>1.7</title>
+      <pubDate>Sun, 05 Jul 2026 00:34:43 +0000</pubDate>
+      <sparkle:version>1.7</sparkle:version>
+      <sparkle:shortVersionString>1.7</sparkle:shortVersionString>
+      <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
+      <description><![CDATA[<ul><li>Send camera video at 480p instead of 720p for smoother streaming</li><li>New screen share resolution menu icon</li><li>Make screen sharing exclusive: starting a share takes it over from your pair</li><li>Add shared-code peers: call across any network without Tailscale (P2P hole punching)</li><li>Show what changed in the update dialog and GitHub release notes</li><li>Add rendezvous server for shared-code calls, deployed automatically from CI</li></ul>]]></description>
+      <enclosure url="https://github.com/benborgers/pairwise/releases/download/v1.7/Pairwise-1.7.dmg" sparkle:edSignature="M4WJcq5FoYdDzjk1ZILxZFGyTHwBF0QVJlvKf8mpXp1v/PQun5bnD3sjIt+SwOOhC5sgxPVOgjxvhx4HQiQMAg==" length="1649031" type="application/octet-stream"/>
+    </item>
+    <item>
       <title>1.6</title>
       <pubDate>Sun, 05 Jul 2026 00:06:09 +0000</pubDate>
       <sparkle:version>1.6</sparkle:version>
