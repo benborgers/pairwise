@@ -142,8 +142,18 @@ final class CameraCapture: NSObject, AVCaptureVideoDataOutputSampleBufferDelegat
                 let dims = CMVideoFormatDescriptionGetDimensions(best.formatDescription)
                 PWLog("camera format pinned to \(dims.width)x\(dims.height) on \(device.localizedName)")
             }
-            device.activeVideoMinFrameDuration = CMTime(value: 1, timescale: 30)
-            device.activeVideoMaxFrameDuration = CMTime(value: 1, timescale: 24)
+            // Clamp to the active format's supported durations: setting one
+            // outside the range throws an uncaught NSException. The Studio
+            // Display Camera's formats support exactly one rate (30.00003
+            // fps, min == max), so even a plain 1/30 is out of range.
+            if let range = device.activeFormat.videoSupportedFrameRateRanges
+                .max(by: { $0.maxFrameRate < $1.maxFrameRate }) {
+                let clamp = { (d: CMTime) in
+                    min(max(d, range.minFrameDuration), range.maxFrameDuration)
+                }
+                device.activeVideoMinFrameDuration = clamp(CMTime(value: 1, timescale: 30))
+                device.activeVideoMaxFrameDuration = clamp(CMTime(value: 1, timescale: 24))
+            }
             device.unlockForConfiguration()
         } catch {
             PWLog("could not configure format on \(device.localizedName): \(error)")
