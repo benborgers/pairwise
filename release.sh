@@ -59,21 +59,42 @@ else
   SIGNATURE=$("$SPARKLE_BIN/sign_update" "$DMG" | tr -d '\n')  # sparkle:edSignature="…" length="…"
 fi
 
+# Release notes: the commit subjects since the previous release tag (usually
+# a single commit, since CI cuts a release on every push). Shown both on the
+# GitHub release and in Sparkle's update dialog.
+PREV_MINOR=$(git tag -l 'v1.*' | sed 's/^v1\.//' | sort -n | tail -1)
+if [[ -n "$PREV_MINOR" ]]; then
+  NOTES=$(git log --format='%s' "v1.$PREV_MINOR..HEAD" | grep -v '\[skip ci\]' || true)
+else
+  NOTES=$(git log --format='%s' -1)
+fi
+[[ -n "$NOTES" ]] || NOTES="Release $VERSION"
+
 URL="https://github.com/$REPO/releases/download/$TAG/Pairwise-$VERSION.dmg"
 PUBDATE=$(date -R)
-ITEM="    <item>\\
-      <title>$VERSION</title>\\
-      <pubDate>$PUBDATE</pubDate>\\
-      <sparkle:version>$VERSION</sparkle:version>\\
-      <sparkle:shortVersionString>$VERSION</sparkle:shortVersionString>\\
-      <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>\\
-      <enclosure url=\"$URL\" $SIGNATURE type=\"application/octet-stream\"/>\\
+NOTES_HTML=$(printf '%s\n' "$NOTES" | python3 -c 'import sys, html
+items = "".join(f"<li>{html.escape(line.strip())}</li>" for line in sys.stdin if line.strip())
+print(f"<ul>{items}</ul>")')
+ITEM="    <item>
+      <title>$VERSION</title>
+      <pubDate>$PUBDATE</pubDate>
+      <sparkle:version>$VERSION</sparkle:version>
+      <sparkle:shortVersionString>$VERSION</sparkle:shortVersionString>
+      <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
+      <description><![CDATA[$NOTES_HTML]]></description>
+      <enclosure url=\"$URL\" $SIGNATURE type=\"application/octet-stream\"/>
     </item>"
-sed -i '' "s|    <!-- releases -->|    <!-- releases -->\\
-$ITEM|" appcast.xml
+# Python instead of sed: commit subjects can contain characters that are
+# unsafe in a sed replacement (&, |, backslashes).
+ITEM="$ITEM" python3 - <<'PY'
+import os, pathlib
+p = pathlib.Path("appcast.xml")
+marker = "    <!-- releases -->"
+p.write_text(p.read_text().replace(marker, marker + "\n" + os.environ["ITEM"], 1))
+PY
 
 echo "Creating GitHub release ${TAG}..."
-gh release create "$TAG" "$DMG" --repo "$REPO" --title "$VERSION" --notes ""
+gh release create "$TAG" "$DMG" --repo "$REPO" --title "$VERSION" --notes "$NOTES"
 
 # [skip ci] so the release workflow's own push doesn't trigger another release.
 git add appcast.xml
